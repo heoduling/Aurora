@@ -4,15 +4,22 @@ import gg.auroramc.aurora.Aurora;
 import gg.auroramc.aurora.expansions.gui.GuiExpansion;
 import net.luckperms.api.LuckPermsProvider;
 import net.luckperms.api.event.user.UserDataRecalculateEvent;
+import net.luckperms.api.event.EventSubscription;
 import net.luckperms.api.node.Node;
 import org.bukkit.entity.Player;
 
 import java.util.Map;
 
 public class LuckPermsHook {
+    private static EventSubscription<UserDataRecalculateEvent> subscription;
     public static void registerListeners() {
-        LuckPermsProvider.get().getEventBus().subscribe(UserDataRecalculateEvent.class, event ->
-                Aurora.getExpansionManager().getExpansion(GuiExpansion.class).refreshPlayerGuis(event.getUser().getUniqueId()));
+        subscription = LuckPermsProvider.get().getEventBus().subscribe(Aurora.getInstance(), UserDataRecalculateEvent.class, event -> {
+            if (!Aurora.isDisabling()) Aurora.getExpansionManager().getExpansion(GuiExpansion.class).refreshPlayerGuis(event.getUser().getUniqueId());
+        });
+    }
+
+    public static void close() {
+        if (subscription != null) { subscription.close(); subscription = null; }
     }
 
     public static void grantPermission(Player player, String permission, Map<String, String> contexts) {

@@ -72,6 +72,10 @@ public class CommandDispatcher {
         actions.put(id, handler);
     }
 
+    public static void unregisterActionHandler(String id, BiConsumer<Player, String> handler) {
+        actions.remove(id, handler);
+    }
+
     public static Collection<String> getActions() {
         return actions.keySet();
     }

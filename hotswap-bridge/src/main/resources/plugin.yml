@@ -1,0 +1,13 @@
+name: AuroraHotSwap
+version: '1.0.0'
+main: gg.auroramc.hotswap.AuroraHotSwap
+api-version: '26.2'
+folia-supported: true
+depend: [PlugManX]
+commands:
+  aurorahotswap:
+    description: Save and replace the Aurora pair while players stay connected
+    permission: aurora.hotswap.admin
+permissions:
+  aurora.hotswap.admin:
+    default: op

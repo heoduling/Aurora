@@ -1,4 +1,5 @@
 name: Aurora
+aurora-hotswap-protocol: 1
 version: '${version}'
 main: gg.auroramc.aurora.Aurora
 api-version: '26.2'

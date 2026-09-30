@@ -87,14 +87,15 @@ public class MySqlStorage implements UserStorage, LeaderboardStorage {
                 try (Connection connection = connection()) {
                     if (Bukkit.getPlayer(uuid) == null) {
                         Aurora.logger().debug("Player: " + uuid + " is left, aborting load.");
+                        handler.accept(createEmptyUser(uuid, dataHolders, false));
                         return;
                     }
                     if (count <= 0) {
                         Aurora.logger().debug("We are still in sync lock after " + syncRetryCount + " retry for player: " + uuid + ". We won't wait anymore. Loading form database...");
                         var user = loadUserForReal(connection, uuid, dataHolders);
                         if (user == null) return;
-                        handler.accept(user);
                         createSyncFlag(uuid, connection);
+                        handler.accept(user);
                         Aurora.logger().debug("Player: " + uuid + " loaded from database.");
                         return;
                     }
@@ -102,15 +103,17 @@ public class MySqlStorage implements UserStorage, LeaderboardStorage {
                     if (!isLocked(uuid, connection)) {
                         var user = loadUserForReal(connection, uuid, dataHolders);
                         if (user == null) return;
-                        handler.accept(user);
                         createSyncFlag(uuid, connection);
+                        handler.accept(user);
                         Aurora.logger().debug("Player: " + uuid + " loaded from database.");
                     } else {
                         Aurora.logger().debug("Sync lock detected for player: " + uuid + ", retrying...");
                         loadUser(uuid, dataHolders, count - 1, handler);
                     }
                 }
-            } catch (Exception ignored) {
+            } catch (Exception failure) {
+                Aurora.getInstance().getLogger().log(java.util.logging.Level.WARNING, "Failed to load user " + uuid, failure);
+                handler.accept(createEmptyUser(uuid, dataHolders, false));
             }
         }, networkLatency, TimeUnit.MILLISECONDS);
     }

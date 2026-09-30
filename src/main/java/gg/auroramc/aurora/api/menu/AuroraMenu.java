@@ -258,6 +258,7 @@ public class AuroraMenu implements InventoryHolder {
     }
 
     public void open(Player player, boolean useScheduler, Consumer<AuroraMenu> onOpen) {
+        if (Aurora.isDisabling()) return;
         if (player.isSleeping()) return;
         if (!player.isOnline()) return;
 
@@ -265,6 +266,7 @@ public class AuroraMenu implements InventoryHolder {
 
         if (useScheduler) {
             player.getScheduler().run(Aurora.getInstance(), (task) -> {
+                if (Aurora.isDisabling()) return;
                 player.openInventory(inventory);
                 if (onOpen != null) {
                     onOpen.accept(this);
@@ -324,14 +326,18 @@ public class AuroraMenu implements InventoryHolder {
     }
 
     public void refresh() {
+        if (Aurora.isDisabling()) return;
         player.getScheduler().run(Aurora.getInstance(), (task) -> {
+            if (Aurora.isDisabling()) return;
             populateInventory(player, true);
             player.updateInventory();
         }, null);
     }
 
     public void refreshDelayed(int delayTicks) {
+        if (Aurora.isDisabling()) return;
         player.getScheduler().runDelayed(Aurora.getInstance(), (task) -> {
+            if (Aurora.isDisabling()) return;
             populateInventory(player, true);
             player.updateInventory();
         }, null, delayTicks);

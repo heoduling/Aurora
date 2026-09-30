@@ -93,6 +93,12 @@ public class AuroraUser {
         }
     }
 
+    public void initMissingData(Class<? extends UserDataHolder> holderClass) {
+        synchronized (serializeLock) {
+            if (!dataHolderMap.containsKey(holderClass)) initData(configuration, Set.of(holderClass));
+        }
+    }
+
     public <T extends DataHolder> T getData(Class<T> holderClass) {
         // Refresh access timer
         Aurora.getUserManager().isUserCached(uuid);

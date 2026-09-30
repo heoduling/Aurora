@@ -29,6 +29,7 @@ import org.bukkit.event.player.PlayerQuitEvent;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
 
 public class UserManager implements Listener {
@@ -36,7 +37,10 @@ public class UserManager implements Listener {
     private volatile UserStorage storage;
     private final ConcurrentHashMap<UUID, Object> playerLocks = new ConcurrentHashMap<>();
     @Getter
-    private final Set<Class<? extends UserDataHolder>> dataHolders = new HashSet<>();
+    private final Set<Class<? extends UserDataHolder>> dataHolders = new CopyOnWriteArraySet<>();
+    private final Set<UUID> loading = ConcurrentHashMap.newKeySet();
+    private volatile boolean closing;
+    private final Set<CompletableFuture<?>> operations = ConcurrentHashMap.newKeySet();
     private ScheduledTask autoSaveTask;
     private ScheduledTask leaderboardUpdateTask;
     @Getter
@@ -122,7 +126,9 @@ public class UserManager implements Listener {
     }
 
     private void autoSaveTask() {
+        if (closing) return;
         this.autoSaveTask = Bukkit.getAsyncScheduler().runDelayed(Aurora.getInstance(), (task) -> {
+            if (closing) return;
             var values = cache.asMap().values();
             var toSave = values.stream().filter(u -> u.isLoaded() && u.isDirty()).toList();
             if (!toSave.isEmpty()) {
@@ -137,7 +143,9 @@ public class UserManager implements Listener {
     }
 
     private void leaderboardUpdateTask() {
+        if (closing) return;
         this.leaderboardUpdateTask = Bukkit.getAsyncScheduler().runDelayed(Aurora.getInstance(), (task) -> {
+            if (closing) return;
             var lbm = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
             var values = cache.asMap().values();
             var toUpdate = new HashMap<UUID, Collection<String>>();
@@ -154,7 +162,7 @@ public class UserManager implements Listener {
                 leaderboardUpdateTask();
                 return;
             }
-            lbm.bulkUpdateUsers(toUpdate).thenRunAsync(lbm::updateLeaderBoards).thenRun(this::leaderboardUpdateTask);
+            track(lbm.bulkUpdateUsers(toUpdate).thenRunAsync(() -> { if (!closing) lbm.updateLeaderBoards(); }).thenRun(this::leaderboardUpdateTask));
         }, 5, TimeUnit.MINUTES);
     }
 
@@ -163,7 +171,37 @@ public class UserManager implements Listener {
     }
 
     public <T extends UserDataHolder> void registerUserDataHolder(Class<T> clazz) {
-        dataHolders.add(clazz);
+        if (!dataHolders.add(clazz)) return;
+        // A dependent plugin may be enabled after Aurora has restored online users.
+        for (var user : cache.asMap().values()) {
+            if (user.isLoaded()) user.initMissingData(clazz);
+        }
+    }
+
+    public void loadOnlinePlayers() {
+        Bukkit.getGlobalRegionScheduler().run(Aurora.getInstance(), task -> {
+            if (closing) return;
+            for (var player : Bukkit.getOnlinePlayers()) {
+                var cached = cache.getIfPresent(player.getUniqueId());
+                if (cached == null || !cached.isLoaded()) loadUser(player.getUniqueId());
+            }
+        });
+    }
+
+    public void beginHotUnload() {
+        closing = true;
+        if (autoSaveTask != null) autoSaveTask.cancel();
+        if (leaderboardUpdateTask != null) leaderboardUpdateTask.cancel();
+    }
+
+    public int getActiveLoads() { return loading.size(); }
+
+    public int getActiveOperations() { return operations.size(); }
+
+    private <T> CompletableFuture<T> track(CompletableFuture<T> future) {
+        operations.add(future);
+        future.whenComplete((value, failure) -> operations.remove(future));
+        return future;
     }
 
     /**
@@ -225,12 +263,17 @@ public class UserManager implements Listener {
      * @param uuid player's uuid to load data for
      */
     public void loadUser(UUID uuid) {
-        CompletableFuture.runAsync(() -> {
+        var cached = cache.getIfPresent(uuid);
+        if (cached != null && cached.isLoaded()) return;
+        if (closing || !loading.add(uuid)) return;
+        track(CompletableFuture.runAsync(() -> {
+            if (closing) { loading.remove(uuid); return; }
             synchronized (getPlayerLock(uuid)) {
                 var lbm = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
 
                 storage.loadUser(uuid, dataHolders, user -> {
-                    if (Bukkit.getPlayer(uuid) == null) return;
+                    try {
+                    if (closing || !user.isLoaded() || Bukkit.getPlayer(uuid) == null) return;
 
                     var maybeUser = cache.getIfPresent(uuid);
 
@@ -241,7 +284,7 @@ public class UserManager implements Listener {
                         Aurora.logger().debug("Updated user " + user.getUniqueId() + " in cache");
 
                         Bukkit.getGlobalRegionScheduler().run(Aurora.getInstance(),
-                                (task) -> Bukkit.getPluginManager().callEvent(new AuroraUserLoadedEvent(user)));
+                                (task) -> { if (!closing) Bukkit.getPluginManager().callEvent(new AuroraUserLoadedEvent(maybeUser)); });
                     } else {
                         lbm.loadUser(user.getUniqueId()).thenAcceptAsync(user.getLeaderboardEntries()::putAll);
 
@@ -249,11 +292,12 @@ public class UserManager implements Listener {
                         Aurora.logger().debug("Loaded user " + user.getUniqueId() + " into cache");
 
                         Bukkit.getGlobalRegionScheduler().run(Aurora.getInstance(),
-                                (task) -> Bukkit.getPluginManager().callEvent(new AuroraUserLoadedEvent(user)));
+                                (task) -> { if (!closing) Bukkit.getPluginManager().callEvent(new AuroraUserLoadedEvent(user)); });
                     }
+                    } finally { loading.remove(uuid); }
                 });
             }
-        });
+        }).exceptionally(failure -> { loading.remove(uuid); Aurora.getInstance().getLogger().log(java.util.logging.Level.SEVERE, "Failed to load user " + uuid, failure); return null; }));
     }
 
     /**
@@ -266,7 +310,9 @@ public class UserManager implements Listener {
     }
 
     public void purgeUserData(UUID uuid) {
-        CompletableFuture.runAsync(() -> {
+        if (closing) return;
+        track(CompletableFuture.runAsync(() -> {
+            if (closing) return;
             synchronized (getPlayerLock(uuid)) {
                 if (cache.getIfPresent(uuid) != null) {
                     var oldUser = cache.getIfPresent(uuid);
@@ -283,7 +329,7 @@ public class UserManager implements Listener {
                     storage.purgeUser(uuid);
                 }
             }
-        });
+        }));
     }
 
     /**
@@ -301,9 +347,10 @@ public class UserManager implements Listener {
     }
 
     public void invalidate(Player player) {
+        if (closing) return;
         var user = cache.getIfPresent(player.getUniqueId());
         if (user == null) return;
-        CompletableFuture.supplyAsync(() -> {
+        track(CompletableFuture.supplyAsync(() -> {
             var lbm = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
             lbm.updateUser(user, Collections.emptyList()).join();
             return saveUserData(user, SaveReason.QUIT);
@@ -315,7 +362,7 @@ public class UserManager implements Listener {
             } else {
                 Aurora.logger().debug("Failed to remove user " + user.getUniqueId() + " from cache, because player is still online");
             }
-        });
+        }));
     }
 
     @EventHandler(ignoreCancelled = true)

@@ -50,6 +50,7 @@ public final class Aurora extends JavaPlugin implements Listener {
 
     @Getter
     private CommandManager commandManager;
+    private Metrics metrics;
 
     @Getter
     private static final MiniMessage miniMessage = MiniMessage.miniMessage();
@@ -148,7 +149,8 @@ public final class Aurora extends JavaPlugin implements Listener {
 
         commandManager.reload();
 
-        var metrics = new Metrics(this, 23780);
+        userManager.loadOnlinePlayers();
+        metrics = new Metrics(this, 23780);
         metrics.addCustomChart(new SimplePie("storage_type", () -> libConfig.getStorageType().equals("mysql") ? "mysql" : "yaml"));
     }
 
@@ -170,10 +172,24 @@ public final class Aurora extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         disabling = true;
+        if (DependencyManager.hasDep("LuckPerms")) LuckPermsHook.close();
+        if (metrics != null) { metrics.shutdown(); metrics = null; }
+        var placeholders = expansionManager.getExpansion(PlaceholderExpansion.class);
+        if (placeholders != null) placeholders.dispose();
         var region = expansionManager.getExpansion(RegionExpansion.class);
         if (region != null && region.getCleaner() != null) region.getCleaner().close();
         userManager.stopTasksAndSaveAllData(true);
         expansionManager.getExpansion(LeaderboardExpansion.class).dispose();
+    }
+
+    /** Called by the paired hot-swap coordinator while this plugin is still enabled. */
+    public void beginHotUnload() {
+        disabling = true;
+        if (DependencyManager.hasDep("LuckPerms")) LuckPermsHook.close();
+        userManager.beginHotUnload();
+        if (metrics != null) { metrics.shutdown(); metrics = null; }
+        var region = expansionManager.getExpansion(RegionExpansion.class);
+        if (region != null && region.getCleaner() != null) region.getCleaner().close();
     }
 
     private void setupExpansions() {
