@@ -3,31 +3,38 @@ package gg.auroramc.aurora.expansions.region;
 import gg.auroramc.aurora.Aurora;
 import gg.auroramc.aurora.api.events.region.RegionBlockBreakEvent;
 import gg.auroramc.aurora.api.events.region.RegionBlockPlaceEvent;
-import gg.auroramc.aurora.api.util.Version;
 import org.bukkit.Bukkit;
+import org.bukkit.ExplosionResult;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
-import org.bukkit.entity.Entity;
-import org.bukkit.entity.EntityType;
+import org.bukkit.block.PistonMoveReaction;
 import org.bukkit.entity.FallingBlock;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockBurnEvent;
+import org.bukkit.event.block.BlockExplodeEvent;
+import org.bukkit.event.block.BlockFadeEvent;
 import org.bukkit.event.block.BlockPistonExtendEvent;
 import org.bukkit.event.block.BlockPistonRetractEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
+import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.world.StructureGrowEvent;
+import org.bukkit.persistence.PersistentDataType;
 
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Predicate;
 
 public class RegionBlockListener implements Listener {
     private final Aurora plugin;
     private final RegionExpansion regionExpansion;
+    private static final NamespacedKey FALLING_PLACED = new NamespacedKey("aurora", "player_placed_falling_block");
     private final BlockFace[] blockFaces = new BlockFace[]{BlockFace.EAST, BlockFace.WEST, BlockFace.NORTH, BlockFace.SOUTH, BlockFace.UP, BlockFace.DOWN};
 
 
@@ -45,35 +52,27 @@ public class RegionBlockListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onSandFall(EntityChangeBlockEvent event) {
-        // Don't do anything on folia.
-        if (Version.isFolia()) return;
+        if (!(event.getEntity() instanceof FallingBlock fallingBlock)) return;
+        Material type = fallingBlock.getBlockData().getMaterial();
+        if (type != Material.SAND && type != Material.RED_SAND && type != Material.GRAVEL) return;
 
+        var entityData = fallingBlock.getPersistentDataContainer();
         Block block = event.getBlock();
-        if (!regionExpansion.isPlacedBlock(block)) return;
-        if (!(event.getEntity() instanceof FallingBlock)) return;
-        Material type = block.getType();
-        if (type == Material.SAND || type == Material.RED_SAND || type == Material.GRAVEL) {
-            Block below = block.getRelative(BlockFace.DOWN);
-            if (below.getType() == Material.AIR || below.getType() == Material.CAVE_AIR || below.getType() == Material.VOID_AIR
-                    || below.getType() == Material.WATER || below.getType() == Material.BUBBLE_COLUMN || below.getType() == Material.LAVA) {
-
+        if (isAir(event.getTo()) || event.getTo() == Material.WATER) {
+            if (block.getType() == type && regionExpansion.isPlacedBlock(block)) {
+                entityData.set(FALLING_PLACED, PersistentDataType.BYTE, (byte) 1);
                 regionExpansion.removePlacedBlock(block);
-                Entity entity = event.getEntity();
-                AtomicInteger counter = new AtomicInteger();
-                Bukkit.getRegionScheduler().runAtFixedRate(plugin, entity.getLocation(), (task) -> {
-                    Block currentBlock = entity.getLocation().getBlock();
-                    if (entity.isDead() || !entity.isValid()) {
-                        if (currentBlock.getType() == type) {
-                            regionExpansion.addPlacedBlock(entity.getLocation().getBlock());
-                        }
-                        task.cancel();
-                    } else if (currentBlock.getType().toString().contains("WEB")) {
-                        task.cancel();
-                    } else if (counter.incrementAndGet() >= 200) {
-                        task.cancel();
-                    }
-                }, 1, 1);
             }
+        } else if (event.getTo() == type) {
+            boolean placed = entityData.has(FALLING_PLACED, PersistentDataType.BYTE);
+            entityData.remove(FALLING_PLACED);
+            var location = block.getLocation();
+            // The event precedes setBlock. Check the accepted landing on its owning region next tick.
+            Bukkit.getRegionScheduler().run(plugin, location, task -> {
+                if (location.getBlock().getType() != type) return;
+                if (placed) regionExpansion.addPlacedBlock(location);
+                else regionExpansion.removePlacedBlock(location);
+            });
         }
     }
 
@@ -93,29 +92,63 @@ public class RegionBlockListener implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBlockPistonExtend(BlockPistonExtendEvent event) {
-        for (Block block : event.getBlocks()) {
-            if (regionExpansion.isPlacedBlock(block)) {
-                regionExpansion.addPlacedBlock(block.getRelative(event.getDirection()));
-            }
-        }
+        moveBlocks(event.getBlocks(), event.getDirection());
         regionExpansion.removePlacedBlock(event.getBlock().getRelative(event.getDirection()));
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBlockPistonRetract(BlockPistonRetractEvent event) {
-        Block lastBlock = event.getBlock();
-        for (Block block : event.getBlocks()) {
-            if (regionExpansion.isPlacedBlock(block)) {
-                regionExpansion.addPlacedBlock(block.getRelative(event.getDirection()));
-                if (block.getLocation().distanceSquared(event.getBlock().getLocation()) > lastBlock.getLocation().distanceSquared(event.getBlock().getLocation())) {
-                    lastBlock = block;
-                }
-            }
-        }
+        moveBlocks(event.getBlocks(), event.getDirection());
+    }
 
-        if (lastBlock != event.getBlock()) {
-            regionExpansion.removePlacedBlock(lastBlock);
+    private void moveBlocks(List<Block> blocks, BlockFace direction) {
+        record Move(Block source, Block target, boolean placed) {}
+        var moves = new ArrayList<Move>();
+        for (var block : blocks) {
+            moves.add(new Move(block, block.getPistonMoveReaction() == PistonMoveReaction.BREAK
+                    ? null : block.getRelative(direction), regionExpansion.isPlacedBlock(block)));
         }
+        // Read every source before writing any destination: slime/honey chains can overlap.
+        for (var move : moves) {
+            regionExpansion.removePlacedBlock(move.source());
+            if (move.target() != null) regionExpansion.removePlacedBlock(move.target());
+        }
+        for (var move : moves) {
+            if (move.placed() && move.target() != null) regionExpansion.addPlacedBlock(move.target());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockExplode(BlockExplodeEvent event) {
+        removeExplodedBlocks(event.blockList(), event.getExplosionResult());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onEntityExplode(EntityExplodeEvent event) {
+        removeExplodedBlocks(event.blockList(), event.getExplosionResult());
+    }
+
+    private void removeExplodedBlocks(List<Block> blocks, ExplosionResult result) {
+        if (result == ExplosionResult.DESTROY || result == ExplosionResult.DESTROY_WITH_DECAY) {
+            blocks.forEach(regionExpansion::removePlacedBlock);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockBurn(BlockBurnEvent event) {
+        regionExpansion.removePlacedBlock(event.getBlock());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockFade(BlockFadeEvent event) {
+        var type = event.getNewState().getType();
+        if (isAir(type) || type == Material.WATER || type == Material.LAVA) {
+            regionExpansion.removePlacedBlock(event.getBlock());
+        }
+    }
+
+    private static boolean isAir(Material type) {
+        return type == Material.AIR || type == Material.CAVE_AIR || type == Material.VOID_AIR;
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)

@@ -99,7 +99,8 @@ dependencies {
 
     // 3rd party
     compileOnly("net.essentialsx:EssentialsX:2.21.0-SNAPSHOT") {
-        exclude(group = "org.spigotmc", module = "spigot-api")
+        // Only the public API is used; server-version providers are supplied by EssentialsX.
+        isTransitive = false
     }
     compileOnly("com.github.MilkBowl:VaultAPI:1.7.1")
     compileOnly("me.clip:placeholderapi:2.11.6")
@@ -119,13 +120,13 @@ dependencies {
     compileOnly("org.black_ixx:playerpoints:3.2.7")
     compileOnly("com.willfp:eco:6.74.2")
     compileOnly("com.willfp:EcoBits:1.8.4")
-    compileOnly("com.nexomc:nexo:1.8.0")
+    compileOnly("com.nexomc:nexo:1.8.0") { isTransitive = false }
     compileOnly("com.bgsoftware:WildToolsAPI:2025.1")
     compileOnly("dev.aurelium:auraskills-api-bukkit:2.3.3")
     compileOnly("su.nightexpress.nightcore:main:2.16.2")
     compileOnly("su.nightexpress.excellenteconomy:ExcellentEconomy:2.8.0")
     compileOnly("me.kryniowesegryderiusz:kgenerators-core:7.3") {
-        exclude(group = "com.iridium", module = "IridiumSkyblock")
+        isTransitive = false
     }
     compileOnly(name = "CrackShot", group = "com.shampaggon.crackshot", version = "0.98.13")
 

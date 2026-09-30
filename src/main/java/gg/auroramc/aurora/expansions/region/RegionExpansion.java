@@ -6,25 +6,33 @@ import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.block.Block;
+import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 
 public class RegionExpansion implements AuroraExpansion {
     private NamespacedKey createKey(Block block) {
-        var loc = Integer.toHexString(block.getLocation().hashCode());
-        return new NamespacedKey(Aurora.getInstance(), loc);
+        return createKey(block.getLocation());
     }
 
     private NamespacedKey createKey(Location location) {
-        var loc = Integer.toHexString(location.hashCode());
-        return new NamespacedKey(Aurora.getInstance(), loc);
+        return new NamespacedKey("aurora", "placed_v2_" + (location.getBlockX() & 15)
+                + "_" + location.getBlockY() + "_" + (location.getBlockZ() & 15));
+    }
+
+    private boolean hasLegacyMarker(PersistentDataContainer data, Location location) {
+        var blockLocation = new Location(location.getWorld(), location.getBlockX(), location.getBlockY(), location.getBlockZ());
+        return data.has(new NamespacedKey("aurora", Integer.toHexString(blockLocation.hashCode())))
+                || data.has(new NamespacedKey("aurora", Integer.toHexString(location.hashCode())));
     }
 
     public boolean isPlacedBlock(Block block) {
-        return block.getChunk().getPersistentDataContainer().has(createKey(block));
+        return isPlacedBlock(block.getLocation());
     }
 
     public boolean isPlacedBlock(Location location) {
-        return location.getChunk().getPersistentDataContainer().has(createKey(location));
+        var data = location.getChunk().getPersistentDataContainer();
+        var placed = data.get(createKey(location), PersistentDataType.BYTE);
+        return placed != null ? placed == 1 : hasLegacyMarker(data, location);
     }
 
     public void addPlacedBlock(Block block) {
@@ -36,11 +44,17 @@ public class RegionExpansion implements AuroraExpansion {
     }
 
     public void removePlacedBlock(Block block) {
-        block.getChunk().getPersistentDataContainer().remove(createKey(block));
+        removePlacedBlock(block.getLocation());
     }
 
     public void removePlacedBlock(Location location) {
-        location.getChunk().getPersistentDataContainer().remove(createKey(location));
+        var data = location.getChunk().getPersistentDataContainer();
+        if (hasLegacyMarker(data, location)) {
+            // A legacy hash can also belong to another position. Keep it, and override only this block.
+            data.set(createKey(location), PersistentDataType.BYTE, (byte) 0);
+        } else {
+            data.remove(createKey(location));
+        }
     }
 
     @Override
