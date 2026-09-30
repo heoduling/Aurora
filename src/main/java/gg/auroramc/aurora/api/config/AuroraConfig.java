@@ -21,6 +21,9 @@ public abstract class AuroraConfig {
     @IgnoreField
     private final YamlConfiguration rawConfiguration;
 
+    @IgnoreField
+    private boolean loadedSuccessfully;
+
     @Getter
     private int configVersion = 0;
 
@@ -30,6 +33,7 @@ public abstract class AuroraConfig {
 
         try {
             this.rawConfiguration.load(file);
+            loadedSuccessfully = true;
 
             var migrationSteps = getApplicableMigrationSteps(rawConfiguration.getInt("config-version", 0), migrationParams);
 
@@ -90,6 +94,8 @@ public abstract class AuroraConfig {
     public YamlConfiguration getRawConfig() {
         return rawConfiguration;
     }
+
+    protected final boolean loadedSuccessfully() { return loadedSuccessfully; }
 
     public void load() {
         ConfigManager.load(this, rawConfiguration);

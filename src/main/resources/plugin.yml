@@ -41,6 +41,7 @@ permissions:
     default: op
     children:
       - aurora.core.admin.reload
+      - aurora.core.admin.cleaner
       - aurora.core.admin.dispatch
       - aurora.core.admin.meta
       - aurora.core.admin.dbmigrate
@@ -62,6 +63,9 @@ permissions:
     children:
       - aurora.core.user.stash.open
       - aurora.core.user.merchant.open
+  aurora.core.admin.cleaner:
+    description: Allows switching and inspecting the block marker cleaner
+    default: op
   aurora.core.user.language:
     description: Allows player to use the language command
     default: false

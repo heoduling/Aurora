@@ -30,6 +30,18 @@ public class AuroraCommand extends BaseCommand {
         this.plugin = plugin;
     }
 
+    @Subcommand("cleaner")
+    @CommandCompletion("on|off|status")
+    @CommandPermission("aurora.core.admin.cleaner")
+    public void onCleaner(CommandSender sender, @Default("status") String action) {
+        var region = AuroraAPI.getRegionManager();
+        if (region == null || region.getCleaner() == null) {
+            Chat.sendMessage(sender, "&c方块来源跟踪未开启，Cleaner 当前不可用。");
+            return;
+        }
+        region.getCleaner().command(sender, action);
+    }
+
     @Subcommand("reload")
     @CommandPermission("aurora.core.admin.reload")
     public void onReload(CommandSender sender) {

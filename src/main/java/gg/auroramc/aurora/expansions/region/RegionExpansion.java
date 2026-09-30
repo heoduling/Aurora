@@ -10,6 +10,10 @@ import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 
 public class RegionExpansion implements AuroraExpansion {
+    private BlockMarkerCleaner cleaner;
+
+    public BlockMarkerCleaner getCleaner() { return cleaner; }
+
     private NamespacedKey createKey(Block block) {
         return createKey(block.getLocation());
     }
@@ -21,8 +25,11 @@ public class RegionExpansion implements AuroraExpansion {
 
     private boolean hasLegacyMarker(PersistentDataContainer data, Location location) {
         var blockLocation = new Location(location.getWorld(), location.getBlockX(), location.getBlockY(), location.getBlockZ());
-        return data.has(new NamespacedKey("aurora", Integer.toHexString(blockLocation.hashCode())))
-                || data.has(new NamespacedKey("aurora", Integer.toHexString(location.hashCode())));
+        int blockHash = blockLocation.hashCode(), rawHash = location.hashCode();
+        return data.has(new NamespacedKey("aurora", Integer.toHexString(blockHash)))
+                || (rawHash != blockHash && data.has(new NamespacedKey("aurora", Integer.toHexString(rawHash))))
+                || CompactBlockMarkers.hasLegacy(data, blockHash)
+                || (rawHash != blockHash && CompactBlockMarkers.hasLegacy(data, rawHash));
     }
 
     public boolean isPlacedBlock(Block block) {
@@ -32,7 +39,7 @@ public class RegionExpansion implements AuroraExpansion {
     public boolean isPlacedBlock(Location location) {
         var data = location.getChunk().getPersistentDataContainer();
         var placed = data.get(createKey(location), PersistentDataType.BYTE);
-        return placed != null ? placed == 1 : hasLegacyMarker(data, location);
+        return placed != null ? placed == 1 : !CompactBlockMarkers.isCleared(data, location) && hasLegacyMarker(data, location);
     }
 
     public void addPlacedBlock(Block block) {
@@ -49,7 +56,7 @@ public class RegionExpansion implements AuroraExpansion {
 
     public void removePlacedBlock(Location location) {
         var data = location.getChunk().getPersistentDataContainer();
-        if (hasLegacyMarker(data, location)) {
+        if (hasLegacyMarker(data, location) && !CompactBlockMarkers.isCleared(data, location)) {
             // A legacy hash can also belong to another position. Keep it, and override only this block.
             data.set(createKey(location), PersistentDataType.BYTE, (byte) 0);
         } else {
@@ -61,7 +68,13 @@ public class RegionExpansion implements AuroraExpansion {
     public void hook() {
         var plugin = Aurora.getInstance();
         Bukkit.getPluginManager().registerEvents(new RegionBlockListener(plugin, this), plugin);
+        cleaner = new BlockMarkerCleaner(plugin);
+        Bukkit.getPluginManager().registerEvents(cleaner, plugin);
+        cleaner.reload();
     }
+
+    @Override
+    public void reload() { if (cleaner != null) cleaner.reload(); }
 
     @Override
     public boolean canHook() {

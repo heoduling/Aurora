@@ -8,6 +8,7 @@ import lombok.Setter;
 import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.*;
 import java.util.function.Consumer;
 
@@ -74,7 +75,28 @@ public class Config extends AuroraConfig {
 
 
     public Config() {
-        super(new File(Aurora.getInstance().getDataFolder(), "config.yml"));
+        this(new File(Aurora.getInstance().getDataFolder(), "config.yml"));
+    }
+
+    public Config(File file) {
+        super(file);
+        // Also repair a missing key when an already upgraded config is reloaded.
+        if (loadedSuccessfully() && ensureCleanerDefaults(getRawConfig())) {
+            try { getRawConfig().save(file); }
+            catch (IOException failure) { throw new IllegalStateException("Cannot merge cleaner defaults into " + file, failure); }
+        }
+    }
+
+    private static boolean ensureCleanerDefaults(YamlConfiguration yaml) {
+        boolean changed = false;
+        String key = "block-tracker.cleaner-enabled";
+        if (!yaml.contains(key)) { yaml.set(key, true); changed = true; }
+        if (yaml.getComments(key).isEmpty()) {
+            yaml.setComments(key, List.of("默认开启：逐步整理已加载区块的历史来源标记，保留现有防刷判断。",
+                    "使用 /aurora cleaner on|off|status 控制；开关会保存，重启后仍有效。"));
+            changed = true;
+        }
+        return changed;
     }
 
     @Override
@@ -213,6 +235,10 @@ public class Config extends AuroraConfig {
                             "Supported plugins: Vault, Essentials, CMI, PlayerPoints, ExcellentEconomy, CoinsEngine, EcoBits, EliteMobs", "RoyaleEconomy", "RoyaleEconomyBank",
                             "Changing this requires a full restart"));
                     yaml.set("config-version", 14);
+                },
+                (yaml) -> {
+                    ensureCleanerDefaults(yaml);
+                    yaml.set("config-version", 15);
                 }
         );
     }
