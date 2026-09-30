@@ -263,8 +263,6 @@ public class UserManager implements Listener {
      * @param uuid player's uuid to load data for
      */
     public void loadUser(UUID uuid) {
-        var cached = cache.getIfPresent(uuid);
-        if (cached != null && cached.isLoaded()) return;
         if (closing || !loading.add(uuid)) return;
         track(CompletableFuture.runAsync(() -> {
             if (closing) { loading.remove(uuid); return; }
