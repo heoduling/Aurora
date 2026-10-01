@@ -291,7 +291,7 @@ public final class BlockMarkerCleaner implements Listener {
         var s = status();
         String state = !s.enabled() ? "已暂停" : isScanning() || s.pendingChunks() > 0
                 ? "仍有区块待检查/处理" : "当前队列处理完毕";
-        return "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；边检查边处理；等待区块 " + s.pendingChunks()
+        return "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；发现可处理项即处理；等待区块 " + s.pendingChunks()
                 + "\n&e检查完成 " + getCheckedChunks() + " 次（含空区块）；" + state
                 + "\n&a整理并移除旧存储项 " + (s.compactedLegacyKeys() + s.compactedClearKeys()) + "（原信息保留）"
                 + "\n&a直接删除无用记录 " + s.deletedKeys() + "；存储项净减少 " + getNetRemovedKeys()
@@ -379,7 +379,7 @@ public final class BlockMarkerCleaner implements Listener {
                     Integer hash = CompactBlockMarkers.legacyHash(key);
                     if (hash != null) {
                         hasLegacy |= data.has(key);
-                        if (matches(data, key, (byte) 1)) add(CompactBlockMarkers.LEGACY[CompactBlockMarkers.bucket(hash)], true, key, hash);
+                        if (matches(data, key, (byte) 1)) collect(data, CompactBlockMarkers.LEGACY[CompactBlockMarkers.bucket(hash)], true, key, hash);
                         else skipped++;
                     } else if (CompactBlockMarkers.archiveIndex(key, CompactBlockMarkers.LEGACY) >= 0) {
                         hasLegacy |= !data.has(key, PersistentDataType.INTEGER_ARRAY)
@@ -390,46 +390,31 @@ public final class BlockMarkerCleaner implements Listener {
                     } else {
                         Long coordinate = CompactBlockMarkers.clearCoordinate(key);
                         if (coordinate != null && matches(data, key, (byte) 0))
-                            add(CompactBlockMarkers.CLEARED[(int) (long) coordinate & 255], false, key, coordinate);
+                            collect(data, CompactBlockMarkers.CLEARED[(int) (long) coordinate & 255], false, key, coordinate);
                     }
                     if (System.nanoTime() >= deadline) break;
                 }
-                if (keys.hasNext()) {
-                    // Commit collected legacy groups while the remaining keys are still being
-                    // checked. False overrides wait for the full scan to prove their dependency.
-                    var ready = groups.values().stream()
-                            .filter(g -> g.legacy && g.entries.size() >= CompactBlockMarkers.MIN_VALUES).toList();
-                    if (!ready.isEmpty()) committing = ready.iterator();
-                } else {
-                    collecting = false;
-                    committing = groups.values().iterator();
-                }
+                if (keys.hasNext()) return false;
+                collecting = false;
+                committing = groups.values().iterator();
                 return false;
             }
             while (touched++ < KEYS_PER_STEP) {
                 if (group == null) {
                     if (!committing.hasNext()) break;
                     group = committing.next();
-                    if (!prepare(data)) { if (collecting) group.reset(); group = null; continue; }
+                    if (!prepare(data)) { group = null; continue; }
                 }
                 if (group.cursor < group.entries.size()) {
-                    var entry = group.entries.get(group.cursor++);
-                    if (!matches(data, entry.source(), entry.legacy() ? (byte) 1 : (byte) 0)) skipped++;
-                    else if (!entry.legacy() && !hasLegacy) { data.remove(entry.source()); deleted++; }
-                    else if (group.selected.size() < CompactBlockMarkers.MAX_VALUES
-                            && (Arrays.binarySearch(group.base, entry.value()) >= 0
-                            || group.base.length + group.selected.size() < CompactBlockMarkers.MAX_VALUES)) group.selected.add(entry);
-                    else skipped++;
+                    select(data, group.entries.get(group.cursor++));
                 } else {
                     commit(data);
-                    if (collecting) group.reset();
                     group = null;
-                    return false; // At most one atomic archive write (128 source keys) per work step.
+                    return false; // One leftover group per final-pass step; discovery commits eligible sources inline.
                 }
                 if (System.nanoTime() >= deadline) return false;
             }
             if (group != null || committing.hasNext()) return false;
-            if (collecting) { committing = null; return false; }
             if (!hasLegacy) {
                 if (removingArchives == null) removingArchives = clearArchives.iterator();
                 while (removingArchives.hasNext() && touched++ < KEYS_PER_STEP) {
@@ -442,12 +427,34 @@ public final class BlockMarkerCleaner implements Listener {
             return true;
         }
 
-        private void add(NamespacedKey target, boolean legacy, NamespacedKey source, long value) {
-            groups.computeIfAbsent(target, key -> new Group(key, legacy)).entries.add(new Entry(source, legacy, value));
+        private void collect(PersistentDataContainer data, NamespacedKey target, boolean legacy, NamespacedKey source, long value) {
+            var collected = groups.computeIfAbsent(target, key -> new Group(key, legacy));
+            collected.entries.add(new Entry(source, legacy, value));
+            // Reuse an existing bounded archive immediately. A new archive still needs four
+            // sources to avoid increasing storage for sparse data; commit on the fourth key,
+            // before checking any subsequent key, without a deferred commit phase.
+            if (collected.entries.size() < CompactBlockMarkers.MIN_VALUES && !data.has(target)) return;
+            group = collected;
+            if (prepare(data)) {
+                for (var entry : group.entries) select(data, entry);
+                commit(data);
+            }
+            collected.reset();
+            group = null;
+        }
+
+        private void select(PersistentDataContainer data, Entry entry) {
+            if (!matches(data, entry.source(), entry.legacy() ? (byte) 1 : (byte) 0)) skipped++;
+            else if (!entry.legacy() && !collecting && !hasLegacy) { data.remove(entry.source()); deleted++; }
+            else if (group.selected.size() < CompactBlockMarkers.MAX_VALUES
+                    && (Arrays.binarySearch(group.base, entry.value()) >= 0
+                    || group.base.length + group.selected.size() < CompactBlockMarkers.MAX_VALUES)) group.selected.add(entry);
+            else skipped++;
         }
 
         private boolean prepare(PersistentDataContainer data) {
-            if (!group.legacy && !hasLegacy) { group.base = new long[0]; return true; }
+            if (group.entries.isEmpty()) return false;
+            if (!group.legacy && !collecting && !hasLegacy) { group.base = new long[0]; return true; }
             if (!data.has(group.target)) {
                 if (group.entries.size() < CompactBlockMarkers.MIN_VALUES) { skipped += group.entries.size(); return false; }
                 group.base = new long[0]; return true;
@@ -468,7 +475,7 @@ public final class BlockMarkerCleaner implements Listener {
         }
 
         private void commit(PersistentDataContainer data) {
-            if (!group.legacy && !hasLegacy) return;
+            if (!group.legacy && !collecting && !hasLegacy) return;
             int selectedCount = group.selected.size();
             group.selected.removeIf(entry -> !matches(data, entry.source(), entry.legacy() ? (byte) 1 : (byte) 0));
             skipped += selectedCount - group.selected.size();
@@ -491,7 +498,10 @@ public final class BlockMarkerCleaner implements Listener {
                     for (int i = 0; i < values.length; i++) hashes[i] = (int) values[i];
                     data.set(group.target, PersistentDataType.INTEGER_ARRAY, hashes);
                 } else data.set(group.target, PersistentDataType.LONG_ARRAY, values);
-                if (created) createdArchives++;
+                if (created) {
+                    createdArchives++;
+                    if (!group.legacy) clearArchives.add(group.target);
+                }
             }
             for (var entry : group.selected) {
                 data.remove(entry.source());

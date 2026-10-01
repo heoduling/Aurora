@@ -108,7 +108,128 @@ class BlockMarkerCleanerTest {
     }
 
     @Test
-    void falseOverridesWaitUntilLateLegacyDependenciesAreKnown() {
+    void removesArchivedLegacySourceBeforeCheckingTheNextKey() {
+        int hash = 12345;
+        var source = old(hash);
+        data.set(CompactBlockMarkers.LEGACY[CompactBlockMarkers.bucket(hash)], PersistentDataType.INTEGER_ARRAY,
+                new int[]{hash, hash + 1, hash + 2, hash + 3});
+        data.set(source, PersistentDataType.BYTE, (byte) 1);
+        var ordered = new LinkedHashSet<NamespacedKey>();
+        ordered.add(source);
+        for (int i = 0; i < 4096; i++) {
+            var key = new NamespacedKey("foreign", "keep_immediate_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        var work = new BlockMarkerCleaner.Work(checkRemovalBeforeNextKey(ordered, source));
+        assertFalse(work.step(data, Long.MAX_VALUE));
+        assertEquals(1, work.legacy);
+        assertTrue(work.keys.hasNext());
+        assertTrue(CompactBlockMarkers.hasLegacy(data, hash));
+        drain(work);
+    }
+
+    @Test
+    void removesArchivedFalseSourceBeforeCheckingTheNextKeyAndLateLegacy() {
+        var source = new NamespacedKey("aurora", "placed_v2_0_64_2");
+        data.set(CompactBlockMarkers.CLEARED[2], PersistentDataType.LONG_ARRAY,
+                new long[]{16386, 16642, 16898, 17154});
+        data.set(source, PersistentDataType.BYTE, (byte) 0);
+        var ordered = new LinkedHashSet<NamespacedKey>();
+        ordered.add(source);
+        for (int i = 0; i < 4096; i++) {
+            var key = new NamespacedKey("foreign", "keep_immediate_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        var unknownLegacy = old(new Location(world, 0, 64, 2).hashCode());
+        data.set(unknownLegacy, PersistentDataType.STRING, "keep");
+        ordered.add(unknownLegacy);
+        var work = new BlockMarkerCleaner.Work(checkRemovalBeforeNextKey(ordered, source));
+        assertFalse(work.step(data, Long.MAX_VALUE));
+        assertEquals(1, work.clears);
+        assertEquals(0, work.deleted);
+        assertTrue(work.keys.hasNext());
+        assertFalse(region.isPlacedBlock(new Location(world, 0, 64, 2)));
+        drain(work);
+        assertEquals("keep", data.get(unknownLegacy, PersistentDataType.STRING));
+        assertFalse(region.isPlacedBlock(new Location(world, 0, 64, 2)));
+    }
+
+    Set<NamespacedKey> checkRemovalBeforeNextKey(Set<NamespacedKey> ordered, NamespacedKey source) {
+        return checkRemovalBeforeNextKey(ordered, source, 1);
+    }
+
+    Set<NamespacedKey> checkRemovalBeforeNextKey(Set<NamespacedKey> ordered, NamespacedKey source, int minimumCheckedKeys) {
+        return new AbstractSet<>() {
+            @Override public int size() { return ordered.size(); }
+            @Override public Iterator<NamespacedKey> iterator() {
+                var iterator = ordered.iterator();
+                return new Iterator<>() {
+                    int checked;
+                    @Override public boolean hasNext() { return iterator.hasNext(); }
+                    @Override public NamespacedKey next() {
+                        if (checked++ >= minimumCheckedKeys) assertFalse(data.has(source), "Eligible source must be removed before checking the next key");
+                        return iterator.next();
+                    }
+                };
+            }
+        };
+    }
+
+    @Test
+    void newArchiveIsCommittedOnTheFourthSourceBeforeCheckingTheFifthKey() {
+        addBucket(12345, 4);
+        var sources = new LinkedHashSet<>(values.keySet());
+        var ordered = new LinkedHashSet<>(sources);
+        for (int i = 0; i < 4096; i++) {
+            var key = new NamespacedKey("foreign", "keep_immediate_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        beforeRemoval = key -> {
+            Integer hash = CompactBlockMarkers.legacyHash(key);
+            if (hash != null) assertTrue(CompactBlockMarkers.hasLegacy(data, hash));
+        };
+        var work = new BlockMarkerCleaner.Work(checkRemovalBeforeNextKey(ordered, sources.iterator().next(), 4));
+        assertFalse(work.step(data, Long.MAX_VALUE));
+        assertEquals(4, work.legacy);
+        for (var key : sources) assertFalse(data.has(key));
+        assertTrue(work.keys.hasNext());
+        drain(work);
+    }
+
+    @Test
+    void earlyFalseArchiveIsRemovedOnceNoLegacyDependencyIsProven() {
+        var ordered = new LinkedHashSet<NamespacedKey>();
+        for (int y = 64; y < 68; y++) {
+            var key = new NamespacedKey("aurora", "placed_v2_0_" + y + "_2");
+            data.set(key, PersistentDataType.BYTE, (byte) 0);
+            ordered.add(key);
+        }
+        for (int i = 0; i < 4096; i++) {
+            var key = new NamespacedKey("foreign", "keep_immediate_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        int before = values.size();
+        var work = new BlockMarkerCleaner.Work(ordered);
+        assertFalse(work.step(data, Long.MAX_VALUE));
+        assertEquals(4, work.clears);
+        assertEquals(0, work.deleted);
+        assertEquals(1, work.createdArchives);
+        assertTrue(data.has(CompactBlockMarkers.CLEARED[2]));
+        assertTrue(work.keys.hasNext());
+        drain(work);
+        assertFalse(data.has(CompactBlockMarkers.CLEARED[2]));
+        assertEquals(1, work.deleted);
+        assertEquals(4, before - values.size());
+        assertEquals(before - values.size(), work.legacy + work.clears + work.deleted - work.createdArchives);
+        assertEquals("keep", data.get(new NamespacedKey("foreign", "keep_immediate_4095"), PersistentDataType.STRING));
+    }
+
+    @Test
+    void falseOverridesAreRemovedEarlyWhileLateLegacyDependenciesStayProtected() {
         var ordered = new LinkedHashSet<NamespacedKey>();
         for (int y = 64; y < 72; y++) {
             var key = new NamespacedKey("aurora", "placed_v2_0_" + y + "_2");
@@ -124,9 +245,12 @@ class BlockMarkerCleanerTest {
         data.set(unknownLegacy, PersistentDataType.STRING, "keep-presence-based-legacy");
         ordered.add(unknownLegacy);
         var work = new BlockMarkerCleaner.Work(ordered);
-        assertFalse(work.step(data));
+        assertFalse(work.step(data, Long.MAX_VALUE));
         assertEquals(0, work.deleted);
-        for (int y = 64; y < 72; y++) assertTrue(data.has(new NamespacedKey("aurora", "placed_v2_0_" + y + "_2")));
+        assertEquals(8, work.clears);
+        assertTrue(work.keys.hasNext());
+        for (int y = 64; y < 72; y++) assertFalse(data.has(new NamespacedKey("aurora", "placed_v2_0_" + y + "_2")));
+        assertFalse(region.isPlacedBlock(new Location(world, 0, 64, 2)));
         drain(work);
         assertEquals(0, work.deleted);
         assertEquals(8, work.clears);
@@ -158,7 +282,9 @@ class BlockMarkerCleanerTest {
         data.set(unrelated, PersistentDataType.STRING, "unchanged");
         assertFalse(region.isPlacedBlock(new Location(world, 1, -64, 1)));
         var work = complete();
-        assertEquals(2, work.deleted);
+        assertEquals(1, work.clears); // The source was already covered by the existing archive during discovery.
+        assertEquals(1, work.deleted); // After the full dependency check, the redundant archive is removed.
+        assertEquals(2, work.clears + work.deleted - work.createdArchives);
         assertFalse(data.has(falseKey));
         assertFalse(data.has(CompactBlockMarkers.CLEARED[17]));
         assertTrue(region.isPlacedBlock(new Location(world, 2, 90, 2)));
