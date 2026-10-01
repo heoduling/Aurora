@@ -5,6 +5,7 @@ import io.papermc.paper.threadedregions.scheduler.RegionScheduler;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.*;
 import org.bukkit.persistence.PersistentDataContainer;
+import org.bukkit.event.world.ChunkUnloadEvent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -167,6 +168,10 @@ class BlockMarkerCleanerQueueTest {
         drain();
         assertEquals(5000, visited.size());
         assertEquals(0, cleaner.status().completedChunks());
+        assertEquals(5000, cleaner.getCheckedChunks());
+        assertTrue(cleaner.statusMessage().contains("检查完成 5000 次（含空区块）"));
+        assertTrue(cleaner.statusMessage().contains("存储项净减少 0"));
+        assertTrue(cleaner.statusMessage().contains("当前队列处理完毕"));
         assertEquals(1, snapshots);
     }
 
@@ -243,6 +248,26 @@ class BlockMarkerCleanerQueueTest {
         drain();
         assertTrue(visited.isEmpty());
         assertEquals(1, snapshots);
+    }
+
+    @Test
+    void unloadDefersWorkWithoutLoadingTheChunkAndReloadResumesIt() throws Exception {
+        setup(1, false);
+        var chunk = loaded.values().iterator().next();
+        apply(true);
+        next();
+        loaded.clear();
+        region = true;
+        try { cleaner.onUnload(new ChunkUnloadEvent(chunk, true)); }
+        finally { region = false; }
+        drain();
+        assertTrue(visited.isEmpty(), "An unloaded chunk must not be loaded for cleanup");
+        assertTrue(cleaner.statusMessage().contains("区块卸载暂缓 1 次（下次加载继续）"));
+        loaded.put(pack(chunk.getX(), chunk.getZ()), chunk);
+        request(chunk);
+        drain();
+        assertEquals(1, visited.size());
+        assertEquals(1, cleaner.getCheckedChunks());
     }
 
     static long pack(int x, int z) { return ((long) x << 32) | (z & 0xffffffffL); }

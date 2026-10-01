@@ -31,6 +31,8 @@ import java.util.logging.Level;
 /** One loaded chunk at a time, with no idle timer, chunk tickets or block-height scan. */
 public final class BlockMarkerCleaner implements Listener {
     private static final int MAX_PENDING = 4096;
+    private static final long BATCH_NANOS = 1_000_000;
+    private static final int MAX_STEPS_PER_BATCH = 8;
     private final Aurora plugin;
     private final Map<ChunkId, Job> jobs = new ConcurrentHashMap<>();
     private final Semaphore slots = new Semaphore(MAX_PENDING);
@@ -38,6 +40,7 @@ public final class BlockMarkerCleaner implements Listener {
     private final AtomicBoolean rescanRequested = new AtomicBoolean();
     private final LongAdder chunks = new LongAdder(), legacy = new LongAdder(), clears = new LongAdder();
     private final LongAdder deleted = new LongAdder(), skipped = new LongAdder(), queueSkipped = new LongAdder();
+    private final LongAdder emptyChunks = new LongAdder(), createdArchives = new LongAdder(), unloaded = new LongAdder();
     private final AtomicLong maxBatchNanos = new AtomicLong();
     private final AtomicLong maxSnapshotNanos = new AtomicLong();
     private final LongAdder batchCount = new LongAdder(), totalBatchNanos = new LongAdder();
@@ -50,6 +53,8 @@ public final class BlockMarkerCleaner implements Listener {
     public boolean isEnabled() { return enabled && !closed; }
     public boolean isSaving() { return saving; }
     public boolean isScanning() { return isEnabled() && (scan != null || rescanRequested.get()); }
+    public long getCheckedChunks() { return chunks.sum() + emptyChunks.sum(); }
+    public long getNetRemovedKeys() { return legacy.sum() + clears.sum() + deleted.sum() - createdArchives.sum(); }
 
     public record Status(boolean enabled, int pendingChunks, long completedChunks, long compactedLegacyKeys,
                          long compactedClearKeys, long deletedKeys, long skippedKeys, long queueSkippedChunks,
@@ -130,7 +135,7 @@ public final class BlockMarkerCleaner implements Listener {
     public void onUnload(ChunkUnloadEvent event) {
         var chunk = event.getChunk();
         var job = jobs.get(new ChunkId(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ()));
-        if (job != null) { discard(job); wake(); }
+        if (job != null) { unloaded.increment(); discard(job); wake(); }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -174,22 +179,29 @@ public final class BlockMarkerCleaner implements Listener {
     private void step(Job job) {
         if (!current(job)) return;
         var world = Bukkit.getWorld(job.id.world());
-        if (world == null || !world.isChunkLoaded(job.id.x(), job.id.z())) { finish(job); return; }
+        if (world == null) { finish(job); return; }
+        if (!world.isChunkLoaded(job.id.x(), job.id.z())) { unloaded.increment(); finish(job); return; }
         long start = System.nanoTime();
+        long deadline = start + BATCH_NANOS;
         try {
             assert Bukkit.isOwnedByCurrentRegion(world, job.id.x(), job.id.z()) : "Cleaner chunk owner mismatch";
             var data = world.getChunkAt(job.id.x(), job.id.z()).getPersistentDataContainer();
             if (job.work == null) {
-                if (data.isEmpty()) { finish(job); return; }
+                if (data.isEmpty()) { emptyChunks.increment(); finish(job); return; }
                 // The native getKeys call copies all keys. It cannot itself be split across ticks.
                 long snapshotStart = System.nanoTime();
                 job.work = new Work(data.getKeys());
                 maxSnapshotNanos.accumulateAndGet(System.nanoTime() - snapshotStart, Math::max);
-            } else if (job.work.step(data)) {
-                chunks.increment();
-                account(job);
-                finish(job);
-                return;
+            }
+            // Use the remaining batch budget now, including on the first visit. Small chunks
+            // need not wait a separate tick for each collection/commit/finish phase.
+            for (int step = 0; step < MAX_STEPS_PER_BATCH && current(job) && System.nanoTime() < deadline; step++) {
+                if (job.work.step(data, deadline)) {
+                    chunks.increment();
+                    account(job);
+                    finish(job);
+                    return;
+                }
             }
         } catch (RuntimeException failure) {
             plugin.getLogger().log(Level.SEVERE, "Cleaner failed for " + job.id + "; unprocessed source keys retained", failure);
@@ -217,8 +229,10 @@ public final class BlockMarkerCleaner implements Listener {
         if (job.work == null) return;
         legacy.add(job.work.legacy - job.countedLegacy); clears.add(job.work.clears - job.countedClears);
         deleted.add(job.work.deleted - job.countedDeleted); skipped.add(job.work.skipped - job.countedSkipped);
+        createdArchives.add(job.work.createdArchives - job.countedArchives);
         job.countedLegacy = job.work.legacy; job.countedClears = job.work.clears;
         job.countedDeleted = job.work.deleted; job.countedSkipped = job.work.skipped;
+        job.countedArchives = job.work.createdArchives;
     }
 
     private void cancelJobs() {
@@ -234,13 +248,7 @@ public final class BlockMarkerCleaner implements Listener {
         Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
             if (closed) return;
             if (action.equalsIgnoreCase("status")) {
-                var s = status();
-                reply(sender, "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；待处理区块 " + s.pendingChunks()
-                        + "；本次运行已处理 " + s.completedChunks() + "，收拢旧键 " + s.compactedLegacyKeys()
-                        + "，收拢覆盖键 " + s.compactedClearKeys() + "，删除失效键 " + s.deletedKeys()
-                        + "，保留/跳过 " + s.skippedKeys() + "，队列满延后请求 " + s.queueSkippedChunks()
-                        + "；补扫" + (isScanning() ? "进行中" : "完成")
-                        + "；最高批次 " + String.format(Locale.ROOT, "%.2f", s.maxBatchMillis()) + " ms");
+                reply(sender, statusMessage());
                 return;
             }
             if (!action.equalsIgnoreCase("on") && !action.equalsIgnoreCase("off")) {
@@ -277,6 +285,18 @@ public final class BlockMarkerCleaner implements Listener {
                 Bukkit.getGlobalRegionScheduler().run(plugin, completed -> { saving = false; reply(sender, message); });
             });
         });
+    }
+
+    String statusMessage() {
+        var s = status();
+        String state = !s.enabled() ? "已暂停" : isScanning() || s.pendingChunks() > 0
+                ? "仍有区块待检查/处理" : "当前队列处理完毕";
+        return "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；边检查边处理；等待区块 " + s.pendingChunks()
+                + "\n&e检查完成 " + getCheckedChunks() + " 次（含空区块）；" + state
+                + "\n&a整理并移除旧存储项 " + (s.compactedLegacyKeys() + s.compactedClearKeys()) + "（原信息保留）"
+                + "\n&a直接删除无用记录 " + s.deletedKeys() + "；存储项净减少 " + getNetRemovedKeys()
+                + "\n&e区块卸载暂缓 " + unloaded.sum() + " 次（下次加载继续）；最高单批 "
+                + String.format(Locale.ROOT, "%.2f", s.maxBatchMillis()) + " ms";
     }
 
     private void reply(CommandSender sender, String message) {
@@ -317,7 +337,7 @@ public final class BlockMarkerCleaner implements Listener {
         volatile boolean cancelled;
         volatile ScheduledTask task;
         Work work; // Confined to this chunk's region callbacks.
-        long countedLegacy, countedClears, countedDeleted, countedSkipped;
+        long countedLegacy, countedClears, countedDeleted, countedSkipped, countedArchives;
         Job(ChunkId id) { this.id = id; }
     }
 
@@ -329,6 +349,7 @@ public final class BlockMarkerCleaner implements Listener {
         int cursor;
         long[] base;
         Group(NamespacedKey target, boolean legacy) { this.target = target; this.legacy = legacy; }
+        void reset() { entries.clear(); selected.clear(); cursor = 0; base = null; }
     }
 
     /** The real migration algorithm, separated from scheduling so compatibility can be regression-tested. */
@@ -341,12 +362,16 @@ public final class BlockMarkerCleaner implements Listener {
         Iterator<NamespacedKey> removingArchives;
         Group group;
         boolean hasLegacy;
-        long legacy, clears, deleted, skipped;
+        boolean collecting = true;
+        long legacy, clears, deleted, skipped, createdArchives;
 
         Work(Set<NamespacedKey> keys) { this.keys = keys.iterator(); }
 
         boolean step(PersistentDataContainer data) {
-            long deadline = System.nanoTime() + 1_000_000;
+            return step(data, System.nanoTime() + BATCH_NANOS);
+        }
+
+        boolean step(PersistentDataContainer data, long deadline) {
             int touched = 0;
             if (committing == null) {
                 while (keys.hasNext() && touched++ < KEYS_PER_STEP) {
@@ -367,17 +392,25 @@ public final class BlockMarkerCleaner implements Listener {
                         if (coordinate != null && matches(data, key, (byte) 0))
                             add(CompactBlockMarkers.CLEARED[(int) (long) coordinate & 255], false, key, coordinate);
                     }
-                    if (System.nanoTime() >= deadline) return false;
+                    if (System.nanoTime() >= deadline) break;
                 }
-                if (keys.hasNext()) return false;
-                committing = groups.values().iterator();
+                if (keys.hasNext()) {
+                    // Commit collected legacy groups while the remaining keys are still being
+                    // checked. False overrides wait for the full scan to prove their dependency.
+                    var ready = groups.values().stream()
+                            .filter(g -> g.legacy && g.entries.size() >= CompactBlockMarkers.MIN_VALUES).toList();
+                    if (!ready.isEmpty()) committing = ready.iterator();
+                } else {
+                    collecting = false;
+                    committing = groups.values().iterator();
+                }
                 return false;
             }
             while (touched++ < KEYS_PER_STEP) {
                 if (group == null) {
                     if (!committing.hasNext()) break;
                     group = committing.next();
-                    if (!prepare(data)) { group = null; continue; }
+                    if (!prepare(data)) { if (collecting) group.reset(); group = null; continue; }
                 }
                 if (group.cursor < group.entries.size()) {
                     var entry = group.entries.get(group.cursor++);
@@ -389,12 +422,14 @@ public final class BlockMarkerCleaner implements Listener {
                     else skipped++;
                 } else {
                     commit(data);
+                    if (collecting) group.reset();
                     group = null;
-                    return false; // At most one atomic archive write (128 source keys) per callback.
+                    return false; // At most one atomic archive write (128 source keys) per work step.
                 }
                 if (System.nanoTime() >= deadline) return false;
             }
             if (group != null || committing.hasNext()) return false;
+            if (collecting) { committing = null; return false; }
             if (!hasLegacy) {
                 if (removingArchives == null) removingArchives = clearArchives.iterator();
                 while (removingArchives.hasNext() && touched++ < KEYS_PER_STEP) {
@@ -450,11 +485,13 @@ public final class BlockMarkerCleaner implements Listener {
             }
             // Publish compatibility membership BEFORE removing any source key. An interrupted job is safe to retry.
             if (!Arrays.equals(values, group.base)) {
+                boolean created = !data.has(group.target);
                 if (group.legacy) {
                     int[] hashes = new int[values.length];
                     for (int i = 0; i < values.length; i++) hashes[i] = (int) values[i];
                     data.set(group.target, PersistentDataType.INTEGER_ARRAY, hashes);
                 } else data.set(group.target, PersistentDataType.LONG_ARRAY, values);
+                if (created) createdArchives++;
             }
             for (var entry : group.selected) {
                 data.remove(entry.source());

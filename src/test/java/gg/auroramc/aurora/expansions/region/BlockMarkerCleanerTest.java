@@ -87,6 +87,67 @@ class BlockMarkerCleanerTest {
     }
 
     @Test
+    void compactsCollectedLegacyKeysBeforeFinishingTheChunkScan() {
+        addBucket(12345, 4);
+        var ordered = new LinkedHashSet<>(values.keySet());
+        for (int i = 0; i < 4096; i++) {
+            var key = new NamespacedKey("foreign", "untouched_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        beforeRemoval = key -> {
+            Integer hash = CompactBlockMarkers.legacyHash(key);
+            if (hash != null) assertTrue(CompactBlockMarkers.hasLegacy(data, hash));
+        };
+        var work = new BlockMarkerCleaner.Work(ordered);
+        for (int i = 0; work.legacy == 0 && i < 8; i++) assertFalse(work.step(data));
+        assertEquals(4, work.legacy, "Collected records must be compacted while the remaining keys are still being scanned");
+        assertTrue(work.keys.hasNext(), "Cleaner waited for the full chunk scan before committing");
+        assertEquals("keep", data.get(new NamespacedKey("foreign", "untouched_4095"), PersistentDataType.STRING));
+        drain(work);
+    }
+
+    @Test
+    void falseOverridesWaitUntilLateLegacyDependenciesAreKnown() {
+        var ordered = new LinkedHashSet<NamespacedKey>();
+        for (int y = 64; y < 72; y++) {
+            var key = new NamespacedKey("aurora", "placed_v2_0_" + y + "_2");
+            data.set(key, PersistentDataType.BYTE, (byte) 0);
+            ordered.add(key);
+        }
+        for (int i = 0; i < 256; i++) {
+            var key = new NamespacedKey("foreign", "keep_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        var unknownLegacy = old(new Location(world, 0, 64, 2).hashCode());
+        data.set(unknownLegacy, PersistentDataType.STRING, "keep-presence-based-legacy");
+        ordered.add(unknownLegacy);
+        var work = new BlockMarkerCleaner.Work(ordered);
+        assertFalse(work.step(data));
+        assertEquals(0, work.deleted);
+        for (int y = 64; y < 72; y++) assertTrue(data.has(new NamespacedKey("aurora", "placed_v2_0_" + y + "_2")));
+        drain(work);
+        assertEquals(0, work.deleted);
+        assertEquals(8, work.clears);
+        assertEquals(1, work.createdArchives);
+        assertEquals("keep-presence-based-legacy", data.get(unknownLegacy, PersistentDataType.STRING));
+        assertFalse(region.isPlacedBlock(new Location(world, 0, 64, 2)));
+    }
+
+    @Test
+    void countsNewArchiveKeysSoNetReductionMatchesStoredKeys() {
+        addBucket(12345, 8);
+        int before = values.size();
+        var work = complete();
+        assertEquals(1, work.createdArchives);
+        assertEquals(before - values.size(), work.legacy + work.clears + work.deleted - work.createdArchives);
+        var repeat = complete();
+        assertEquals(0, repeat.createdArchives);
+        assertEquals(0, repeat.legacy + repeat.clears + repeat.deleted);
+    }
+
+    @Test
     void deletesOnlyRedundantFalseFlagsWhenNoLegacyDependencyExists() {
         var falseKey = new NamespacedKey("aurora", "placed_v2_1_-64_1");
         var trueKey = new NamespacedKey("aurora", "placed_v2_2_90_2");
