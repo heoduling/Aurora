@@ -7,6 +7,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Shiroha 26.2 builds command packets on two workers while command-map writes are global. */
 final class CommandTreeGate {
+    static boolean isStartupThread() throws ReflectiveOperationException {
+        return isStartupThread(Bukkit.getServer());
+    }
+
+    static boolean isStartupThread(Object craftServer) throws ReflectiveOperationException {
+        // isPrimaryThread also accepts Folia region threads. Compare the exact bootstrap
+        // thread instead; runtime command writes still require the reader barrier below.
+        var server = RuntimeAccess.call(craftServer, "getServer");
+        return RuntimeAccess.call(server, "getRunningThread") == Thread.currentThread();
+    }
+
     static ThreadPoolExecutor pool() throws ReflectiveOperationException {
         var type = Class.forName("net.minecraft.commands.Commands");
         var value = RuntimeAccess.get(type, "COMMAND_SENDING_POOL");

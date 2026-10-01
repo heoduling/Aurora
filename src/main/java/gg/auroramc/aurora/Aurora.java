@@ -253,7 +253,7 @@ public final class Aurora extends JavaPlugin implements Listener {
             localizationProvider.setLocaleValues(msg.getKey(), msg.getValue().toFlatMap());
         }
 
-        commandManager.reload();
+        hotReload.changeCommands(this, commandManager::reload);
         expansionManager.reloadExpansions();
     }
 

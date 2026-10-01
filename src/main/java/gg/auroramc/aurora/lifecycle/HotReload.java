@@ -14,6 +14,7 @@ import org.bukkit.event.server.*;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
 import java.io.File;
 import java.lang.reflect.Proxy;
 import java.util.*;
@@ -24,13 +25,14 @@ import java.util.logging.Level;
 /** Prepares ordinary PlugMan commands while the plugins can still schedule player-owned cleanup. */
 public final class HotReload implements Listener {
     private final Aurora plugin;
-    private final Set<CompletableFuture<?>> commandChanges = ConcurrentHashMap.newKeySet();
+    private final Map<CompletableFuture<Void>, Plugin> commandChanges = new ConcurrentHashMap<>();
+    private final Map<Plugin, CompletableFuture<Void>> commandResults = new ConcurrentHashMap<>();
     private final Map<Plugin, Object> guards = new IdentityHashMap<>();
     private volatile boolean busy;
     private volatile boolean paused;
     private volatile Plugin allowedUnload;
     private boolean disablingOnly;
-    private volatile Throwable commandFailure;
+    private volatile boolean closed;
 
     public HotReload(Aurora plugin) {
         this.plugin = plugin;
@@ -43,24 +45,65 @@ public final class HotReload implements Listener {
     public boolean isPaused() { return paused; }
 
     public boolean isReady() {
-        if (commandFailure != null) throw new IllegalStateException("Command registration failed", commandFailure);
+        checkCommandFailures();
         return commandChanges.isEmpty() && Aurora.getUserManager().getActiveLoads() == 0
                 && !Aurora.getUserManager().hasUnreadyOnlineUsers();
     }
 
     public CompletableFuture<Void> changeCommands(Runnable change) {
+        // The existing Main/Quests callers pass method references declared by their own
+        // plugin classes. Wrapped/library callbacks can use the explicit-owner overload.
+        return changeCommands(JavaPlugin.getProvidingPlugin(change.getClass()), change);
+    }
+
+    public CompletableFuture<Void> changeCommands(Plugin owner, Runnable change) {
+        Objects.requireNonNull(owner);
+        Objects.requireNonNull(change);
+        if (closed || !owner.isEnabled()) return CompletableFuture.failedFuture(new CancellationException("Command registration owner is stopped"));
         var result = new CompletableFuture<Void>();
-        commandChanges.add(result);
+        commandChanges.put(result, owner);
+        commandResults.put(owner, result);
         result.whenComplete((value, failure) -> commandChanges.remove(result));
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            try { CommandTreeGate.run(plugin, change); result.complete(null); }
+        // A disable may race with publication above. Do not leave its callback or
+        // plugin reference pending if close()/PluginDisableEvent already ran.
+        if (closed || !owner.isEnabled()) {
+            commandResults.remove(owner, result);
+            result.completeExceptionally(new CancellationException("Command registration owner is stopped"));
+            return result;
+        }
+        Runnable guarded = () -> {
+            if (!closed && owner.isEnabled() && !result.isDone()) change.run();
+        };
+        Runnable register = () -> {
+            try {
+                if (CommandTreeGate.isStartupThread()) guarded.run();
+                else CommandTreeGate.run(plugin, guarded);
+                result.complete(null);
+            }
             catch (Throwable failure) {
-                commandFailure = failure;
                 result.completeExceptionally(failure);
                 plugin.getLogger().log(Level.SEVERE, "Failed to update command registrations", failure);
             }
-        });
+        };
+        try {
+            // Cold startup has no player command readers and owns command-map initialization.
+            // Do not start a runtime timeout while the global scheduler is not ticking yet.
+            if (CommandTreeGate.isStartupThread()) register.run();
+            else Bukkit.getAsyncScheduler().runNow(plugin, task -> register.run());
+        } catch (Throwable failure) {
+            result.completeExceptionally(failure);
+            plugin.getLogger().log(Level.SEVERE, "Failed to schedule command registrations", failure);
+        }
         return result;
+    }
+
+    private void checkCommandFailures() {
+        for (var result : commandResults.values()) if (result.isCompletedExceptionally()) {
+            try { result.join(); }
+            catch (CompletionException | CancellationException failure) {
+                throw new IllegalStateException("Command registration failed", failure instanceof CompletionException ? failure.getCause() : failure);
+            }
+        }
     }
 
     public void detach(Plugin dependent) {
@@ -131,7 +174,7 @@ public final class HotReload implements Listener {
     }
 
     private void perform(Plugin plugman, Plugin target, String operation, ScheduledTask coordinator) throws Exception {
-        if (Runtime.version().feature() != 25 || !Bukkit.getVersion().equals("26.2-DEV-9daa83b (MC: 26.2)")) throw new IllegalStateException("Unverified server version: " + Bukkit.getVersion());
+        if (Runtime.version().feature() != 25 || !Set.of("26.2-DEV-9daa83b (MC: 26.2)", "26.2-DEV-a8f1d54 (MC: 26.2)").contains(Bukkit.getVersion())) throw new IllegalStateException("Unverified server version: " + Bukkit.getVersion());
         if (!plugman.getDescription().getVersion().equals("3.1.0-Beta.2")) throw new IllegalStateException("Unverified PlugManX version");
         CommandTreeGate.pool();
         var managerType = Class.forName("core.com.rylinaux.plugman.plugins.PluginManager", true, plugman.getClass().getClassLoader());
@@ -153,7 +196,7 @@ public final class HotReload implements Listener {
         }
         await(() -> commandChanges.isEmpty() && Aurora.getUserManager().getActiveLoads() == 0
                 && Aurora.getUserManager().getActiveOperations() == 0 && !Aurora.getUserManager().hasUnreadyOnlineUsers(), "Player data is still loading");
-        if (commandFailure != null) throw new IllegalStateException("Command registration failed", commandFailure);
+        checkCommandFailures();
         var ids = new HashSet<UUID>();
         var runningTasks = new ArrayList<ScheduledTask>();
         var metrics = new ArrayList<ExecutorService>();
@@ -293,6 +336,7 @@ public final class HotReload implements Listener {
     }
 
     @EventHandler public void disabled(PluginDisableEvent event) {
+        clearCommandChanges(event.getPlugin());
         if (!disablingOnly) removeGuard(event.getPlugin());
         if (event.getPlugin().getName().equals("AuroraQuests") && !Bukkit.isStopping() && bridgeActive()) detach(event.getPlugin());
         if (event.getPlugin().getName().equals("AuroraHotSwap")) {
@@ -332,7 +376,16 @@ public final class HotReload implements Listener {
     }
 
     public void close() {
+        closed = true;
+        for (var owner : new ArrayList<>(commandResults.keySet())) clearCommandChanges(owner);
         for (var guarded : new ArrayList<>(guards.keySet())) removeGuard(guarded);
+    }
+
+    private void clearCommandChanges(Plugin owner) {
+        commandResults.remove(owner);
+        for (var entry : commandChanges.entrySet()) if (entry.getValue() == owner) {
+            entry.getKey().completeExceptionally(new CancellationException("Command registration owner is stopped"));
+        }
     }
 
     private CompletableFuture<Void> onPlayer(Plugin owner, UUID id, Consumer<Player> action, long delay) {

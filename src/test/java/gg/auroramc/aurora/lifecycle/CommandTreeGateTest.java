@@ -7,6 +7,31 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 class CommandTreeGateTest {
+    @Test void bootstrapDetectionUsesTheExactServerThread() throws Exception {
+        var craft = new BootstrapServer(Thread.currentThread());
+        assertTrue(CommandTreeGate.isStartupThread(craft));
+        var other = Executors.newSingleThreadExecutor();
+        try {
+            assertFalse(other.submit(() -> CommandTreeGate.isStartupThread(craft)).get(2, TimeUnit.SECONDS));
+        } finally { other.shutdownNow(); assertTrue(other.awaitTermination(2, TimeUnit.SECONDS)); }
+    }
+
+    @Test void bootstrapDetectionDoesNotAcceptAnotherTickThread() throws Exception {
+        assertFalse(CommandTreeGate.isStartupThread(new BootstrapServer(new Thread("fixture-other-tick"))));
+    }
+
+    public static final class BootstrapServer {
+        private final BootstrapCore core;
+        BootstrapServer(Thread thread) { core = new BootstrapCore(thread); }
+        public BootstrapCore getServer() { return core; }
+    }
+
+    public static final class BootstrapCore {
+        private final Thread thread;
+        BootstrapCore(Thread thread) { this.thread = thread; }
+        public Thread getRunningThread() { return thread; }
+    }
+
     @Test void queuedCommandReadersRunOnlyAfterTheWholeTreeChange() throws Exception {
         var pool = new ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
         try {
