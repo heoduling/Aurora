@@ -1,30 +1,35 @@
 package gg.auroramc.aurora.expansions.region;
 
 import io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler;
+import io.papermc.paper.threadedregions.scheduler.AsyncScheduler;
 import io.papermc.paper.threadedregions.scheduler.RegionScheduler;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.*;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.plugin.IllegalPluginAccessException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class BlockMarkerCleanerQueueTest {
     final ArrayDeque<Runnable> callbacks = new ArrayDeque<>();
+    final ArrayDeque<Runnable> rescanCallbacks = new ArrayDeque<>();
     final Map<Long, Chunk> loaded = new LinkedHashMap<>();
     final Set<Long> visited = new HashSet<>();
     final UUID worldId = UUID.randomUUID();
     final BlockMarkerCleaner cleaner = new BlockMarkerCleaner(null);
     Server previous;
     World world;
-    boolean region, worldAvailable = true;
+    boolean region, worldAvailable = true, stopDuringSubmission;
     int snapshots, peakPending;
 
     void setup(int count, boolean empty) throws Exception {
@@ -56,11 +61,13 @@ class BlockMarkerCleanerQueueTest {
         for (int i = 0; i < count; i++) addChunk(i - count / 2, -i, data);
         var global = proxy(GlobalRegionScheduler.class, scheduler(false));
         var regional = proxy(RegionScheduler.class, scheduler(true));
+        var async = proxy(AsyncScheduler.class, scheduler(false));
         var server = proxy(Server.class, (p, m, a) -> switch (m.getName()) {
             case "getWorlds" -> worldAvailable ? List.of(world) : List.of();
             case "getWorld" -> worldAvailable && worldId.equals(a[0]) ? world : null;
             case "getGlobalRegionScheduler" -> global;
             case "getRegionScheduler" -> regional;
+            case "getAsyncScheduler" -> async;
             case "isOwnedByCurrentRegion" -> region;
             default -> throw new AssertionError(m);
         });
@@ -85,6 +92,10 @@ class BlockMarkerCleanerQueueTest {
     InvocationHandler scheduler(boolean onRegion) {
         return (p, m, args) -> {
             assertTrue(m.getName().equals("run") || m.getName().equals("runDelayed"));
+            if (!onRegion && m.getName().equals("run") && stopDuringSubmission) {
+                cleaner.close();
+                throw new IllegalPluginAccessException("Plugin disabled before global submission");
+            }
             var cancelled = new AtomicBoolean();
             var task = proxy(ScheduledTask.class, (q, method, a) -> {
                 if (method.getName().equals("cancel")) {
@@ -95,6 +106,12 @@ class BlockMarkerCleanerQueueTest {
             });
             for (var argument : args) if (argument instanceof Consumer<?> callback) {
                 @SuppressWarnings("unchecked") var action = (Consumer<ScheduledTask>) callback;
+                if (!onRegion && m.getName().equals("runDelayed") && args[args.length - 1] == TimeUnit.SECONDS) {
+                    assertEquals(30L, args[args.length - 2]);
+                    // Run even a cancelled delayed callback to verify the cleaner rejects it itself.
+                    rescanCallbacks.add(() -> action.accept(task));
+                    return task;
+                }
                 callbacks.add(() -> {
                     if (cancelled.get()) return;
                     region = onRegion;
@@ -138,7 +155,8 @@ class BlockMarkerCleanerQueueTest {
         try {
             var field = BlockMarkerCleaner.class.getDeclaredField(name);
             field.setAccessible(true);
-            return field.get(cleaner);
+            var value = field.get(cleaner);
+            return value instanceof AtomicReference<?> reference ? reference.get() : value;
         } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
     }
 
@@ -268,6 +286,102 @@ class BlockMarkerCleanerQueueTest {
         drain();
         assertEquals(1, visited.size());
         assertEquals(1, cleaner.getCheckedChunks());
+    }
+
+    @Test
+    void repeatsLoadedChunkChecksAfterEachIdleDelay() throws Exception {
+        setup(3, false);
+        apply(true);
+        drain();
+        assertEquals(3, cleaner.getCheckedChunks());
+        assertEquals(1, rescanCallbacks.size());
+        rescanCallbacks.removeFirst().run();
+        drain();
+        assertEquals(6, cleaner.getCheckedChunks());
+        assertEquals(2, snapshots);
+        assertEquals(1, rescanCallbacks.size());
+        rescanCallbacks.removeFirst().run();
+        drain();
+        assertEquals(9, cleaner.getCheckedChunks());
+        assertEquals(3, snapshots);
+    }
+
+    @Test
+    void offAndCloseCancelIdleRescanIncludingLateCallbacks() throws Exception {
+        setup(2, false);
+        apply(true);
+        drain();
+        assertNotNull(readField("rescanTask"));
+        apply(false);
+        assertNull(readField("rescanTask"));
+        rescanCallbacks.removeFirst().run();
+        drain();
+        assertEquals(1, snapshots);
+        apply(true);
+        drain();
+        cleaner.close();
+        assertNull(readField("rescanTask"));
+        rescanCallbacks.removeFirst().run();
+        drain();
+        assertEquals(2, snapshots);
+    }
+
+    @Test
+    void lateCancelledTimerCannotClearTheReplacementTimer() throws Exception {
+        setup(1, false);
+        apply(true);
+        drain();
+        var oldCallback = rescanCallbacks.removeFirst();
+        apply(false);
+        apply(true);
+        drain();
+        var replacement = readField("rescanTask");
+        oldCallback.run();
+        assertSame(replacement, readField("rescanTask"));
+        drain();
+        assertEquals(2, snapshots);
+        rescanCallbacks.removeFirst().run();
+        drain();
+        assertEquals(3, snapshots);
+    }
+
+    @Test
+    void closingDuringTimerWakeRejectsSubmissionWithoutLeavingTheWakeGateSet() throws Exception {
+        setup(1, false);
+        apply(true);
+        drain();
+        stopDuringSubmission = true;
+        assertDoesNotThrow(() -> rescanCallbacks.removeFirst().run());
+        drain();
+        assertFalse(cleaner.isEnabled());
+        assertNull(readField("rescanTask"));
+        assertFalse(((AtomicBoolean) readField("wakePending")).get());
+        assertEquals(1, snapshots);
+    }
+
+    @Test
+    void unloadedActiveChunkDoesNotBlockOtherLoadedChunks() throws Exception {
+        setup(4, false);
+        apply(true);
+        next();
+        Object job = readField("active");
+        var idField = job.getClass().getDeclaredField("id");
+        idField.setAccessible(true);
+        Object id = idField.get(job);
+        var xMethod = id.getClass().getDeclaredMethod("x"); xMethod.setAccessible(true);
+        var zMethod = id.getClass().getDeclaredMethod("z"); zMethod.setAccessible(true);
+        long key = pack((int) xMethod.invoke(id), (int) zMethod.invoke(id));
+        var chunk = loaded.remove(key);
+        region = true;
+        try { cleaner.onUnload(new ChunkUnloadEvent(chunk, true)); }
+        finally { region = false; }
+        drain();
+        assertEquals(3, visited.size());
+        assertFalse(visited.contains(key));
+        loaded.put(key, chunk);
+        request(chunk);
+        drain();
+        assertEquals(4, visited.size());
     }
 
     static long pack(int x, int z) { return ((long) x << 32) | (z & 0xffffffffL); }

@@ -41,7 +41,10 @@ final class CompactBlockMarkers {
     }
 
     static boolean isCleared(PersistentDataContainer data, Location location) {
-        long coordinate = coordinate(location);
+        return isCleared(data, coordinate(location));
+    }
+
+    static boolean isCleared(PersistentDataContainer data, long coordinate) {
         var key = CLEARED[(int) coordinate & 255];
         if (!data.has(key, PersistentDataType.LONG_ARRAY)) return false;
         return Arrays.binarySearch(data.get(key, PersistentDataType.LONG_ARRAY), coordinate) >= 0;

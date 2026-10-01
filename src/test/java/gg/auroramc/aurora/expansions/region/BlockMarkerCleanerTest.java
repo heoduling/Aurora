@@ -382,6 +382,134 @@ class BlockMarkerCleanerTest {
         }
     }
 
+    @Test
+    void deletesAirPlacementBeforeExaminingTheNextKey() {
+        var source = new NamespacedKey("aurora", "placed_v2_15_-64_2");
+        data.set(source, PersistentDataType.BYTE, (byte) 1);
+        var ordered = new LinkedHashSet<NamespacedKey>();
+        ordered.add(source);
+        for (int i = 0; i < 4096; i++) {
+            var key = new NamespacedKey("foreign", "keep_air_" + i);
+            data.set(key, PersistentDataType.STRING, "keep");
+            ordered.add(key);
+        }
+        assertFalse(BlockMarkerCleaner.Work.hasLegacySources(ordered));
+        var work = new BlockMarkerCleaner.Work(checkRemovalBeforeNextKey(ordered, source), false);
+        assertFalse(work.step(data, Long.MAX_VALUE, coordinate -> {
+            assertEquals(-64, (int) (coordinate >> 8));
+            assertEquals(15, (int) (coordinate >> 4) & 15);
+            assertEquals(2, (int) coordinate & 15);
+            return true;
+        }));
+        assertEquals(1, work.expiredDeleted);
+        assertEquals(1, work.deleted);
+        assertTrue(work.collecting);
+        assertFalse(region.isPlacedBlock(new Location(world, 15, -64, 2)));
+        drain(work);
+        assertEquals(4096, values.size());
+    }
+
+    @Test
+    void deletesRedundantFalseFlagAndArchiveDuringDiscoveryWithoutLegacy() {
+        var source = new NamespacedKey("aurora", "placed_v2_1_64_1");
+        data.set(source, PersistentDataType.BYTE, (byte) 0);
+        data.set(CompactBlockMarkers.CLEARED[17], PersistentDataType.LONG_ARRAY, new long[]{16401});
+        var ordered = new LinkedHashSet<>(List.of(source, CompactBlockMarkers.CLEARED[17], old(42)));
+        // The last key is absent: inventory is based on the actual PDC snapshot, not arbitrary names.
+        var work = new BlockMarkerCleaner.Work(checkRemovalBeforeNextKey(ordered, source), false);
+        work.step(data, Long.MAX_VALUE, coordinate -> false);
+        assertFalse(data.has(source));
+        assertFalse(data.has(CompactBlockMarkers.CLEARED[17]));
+        assertEquals(2, work.deleted);
+        assertEquals(0, work.expiredDeleted);
+    }
+
+    @Test
+    void keepsNonAirPlacementsAndUnrecognizedRecords() {
+        var live = new NamespacedKey("aurora", "placed_v2_1_64_1");
+        var wrongType = new NamespacedKey("aurora", "placed_v2_2_64_2");
+        var invalid = new NamespacedKey("aurora", "placed_v2_16_64_0");
+        var foreign = new NamespacedKey("foreign", "placed_v2_3_64_3");
+        data.set(live, PersistentDataType.BYTE, (byte) 1);
+        data.set(wrongType, PersistentDataType.STRING, "keep");
+        data.set(invalid, PersistentDataType.BYTE, (byte) 1);
+        data.set(foreign, PersistentDataType.BYTE, (byte) 1);
+        var before = Map.copyOf(values);
+        var work = new BlockMarkerCleaner.Work(data.getKeys(), false);
+        for (int i = 0; i < 10; i++) if (work.step(data, Long.MAX_VALUE, coordinate -> false)) break;
+        assertEquals(before, values);
+        assertEquals(0, work.expiredDeleted);
+    }
+
+    @Test
+    void retainsShieldForLateLegacyCollisionAndRawLocationHash() {
+        var air = new Location(world, 0, 64, 2);
+        var collision = new Location(world, 0, 60, 11);
+        var raw = new Location(world, .25, 64.25, 2.25, 13.3f, -28.9f);
+        assertEquals(air.hashCode(), collision.hashCode());
+        var source = new NamespacedKey("aurora", "placed_v2_0_64_2");
+        data.set(source, PersistentDataType.BYTE, (byte) 1);
+        data.set(old(air.hashCode()), PersistentDataType.BYTE, (byte) 1);
+        data.set(old(raw.hashCode()), PersistentDataType.STRING, "presence-is-legacy");
+        var ordered = new LinkedHashSet<>(List.of(source, old(air.hashCode()), old(raw.hashCode())));
+        var work = new BlockMarkerCleaner.Work(ordered, BlockMarkerCleaner.Work.hasLegacySources(ordered));
+        work.step(data, Long.MAX_VALUE, coordinate -> true);
+        assertEquals(1, work.legacyShields);
+        assertEquals(0, work.expiredDeleted);
+        assertEquals((byte) 0, data.get(source, PersistentDataType.BYTE));
+        drain(work);
+        assertFalse(region.isPlacedBlock(air));
+        assertFalse(region.isPlacedBlock(raw));
+        assertTrue(region.isPlacedBlock(collision));
+        assertTrue(data.has(old(raw.hashCode()), PersistentDataType.STRING));
+    }
+
+    @Test
+    void deletesAirOverrideAlreadyProtectedByCompatibilityArchive() {
+        var air = new Location(world, 0, 64, 2);
+        var source = new NamespacedKey("aurora", "placed_v2_0_64_2");
+        data.set(source, PersistentDataType.BYTE, (byte) 1);
+        data.set(CompactBlockMarkers.LEGACY[CompactBlockMarkers.bucket(air.hashCode())], PersistentDataType.INTEGER_ARRAY,
+                new int[]{air.hashCode()});
+        data.set(CompactBlockMarkers.CLEARED[2], PersistentDataType.LONG_ARRAY, new long[]{CompactBlockMarkers.coordinate(air)});
+        var work = new BlockMarkerCleaner.Work(data.getKeys(), true);
+        work.step(data, Long.MAX_VALUE, coordinate -> true);
+        drain(work);
+        assertEquals(1, work.expiredDeleted);
+        assertEquals(0, work.legacyShields);
+        assertFalse(data.has(source));
+        assertTrue(CompactBlockMarkers.isCleared(data, air));
+        assertFalse(region.isPlacedBlock(air));
+    }
+
+    @Test
+    void removesEmptyTypedArchivesButRetainsMalformedLegacyArchive() {
+        data.set(CompactBlockMarkers.LEGACY[0], PersistentDataType.INTEGER_ARRAY, new int[0]);
+        data.set(CompactBlockMarkers.CLEARED[0], PersistentDataType.LONG_ARRAY, new long[0]);
+        data.set(CompactBlockMarkers.LEGACY[1], PersistentDataType.STRING, "unknown");
+        data.set(CompactBlockMarkers.LEGACY[2], PersistentDataType.INTEGER_ARRAY, new int[]{2, 1});
+        var work = complete();
+        assertEquals(2, work.emptyArchives);
+        assertEquals(2, work.deleted);
+        assertEquals(2, values.size());
+        assertEquals("unknown", data.get(CompactBlockMarkers.LEGACY[1], PersistentDataType.STRING));
+        assertArrayEquals(new int[]{2, 1}, data.get(CompactBlockMarkers.LEGACY[2], PersistentDataType.INTEGER_ARRAY));
+    }
+
+    @Test
+    void rechecksSourceValueAfterAirInspection() {
+        var source = new NamespacedKey("aurora", "placed_v2_1_64_1");
+        data.set(source, PersistentDataType.BYTE, (byte) 1);
+        var work = new BlockMarkerCleaner.Work(data.getKeys(), false);
+        work.step(data, Long.MAX_VALUE, coordinate -> {
+            data.set(source, PersistentDataType.STRING, "changed-since-snapshot");
+            return true;
+        });
+        drain(work);
+        assertEquals(0, work.expiredDeleted);
+        assertEquals("changed-since-snapshot", data.get(source, PersistentDataType.STRING));
+    }
+
     void assertAllHashesPresent(int count) {
         for (int hash = 0; hash < count; hash++) assertTrue(data.has(old(hash)) || CompactBlockMarkers.hasLegacy(data, hash), "lost hash " + hash);
     }

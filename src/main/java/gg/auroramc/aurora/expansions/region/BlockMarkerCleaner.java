@@ -17,22 +17,27 @@ import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.event.world.WorldUnloadEvent;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.plugin.IllegalPluginAccessException;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongPredicate;
 import java.util.logging.Level;
 
-/** One loaded chunk at a time, with no idle timer, chunk tickets or block-height scan. */
+/** One loaded chunk at a time; a completed round is followed by a delayed loaded-chunk recheck. */
 public final class BlockMarkerCleaner implements Listener {
     private static final int MAX_PENDING = 4096;
     private static final long BATCH_NANOS = 1_000_000;
     private static final int MAX_STEPS_PER_BATCH = 8;
+    private static final long RESCAN_SECONDS = 30;
     private final Aurora plugin;
     private final Map<ChunkId, Job> jobs = new ConcurrentHashMap<>();
     private final Semaphore slots = new Semaphore(MAX_PENDING);
@@ -41,12 +46,14 @@ public final class BlockMarkerCleaner implements Listener {
     private final LongAdder chunks = new LongAdder(), legacy = new LongAdder(), clears = new LongAdder();
     private final LongAdder deleted = new LongAdder(), skipped = new LongAdder(), queueSkipped = new LongAdder();
     private final LongAdder emptyChunks = new LongAdder(), createdArchives = new LongAdder(), unloaded = new LongAdder();
+    private final LongAdder expiredDeleted = new LongAdder(), legacyShields = new LongAdder(), emptyArchives = new LongAdder();
     private final AtomicLong maxBatchNanos = new AtomicLong();
     private final AtomicLong maxSnapshotNanos = new AtomicLong();
     private final LongAdder batchCount = new LongAdder(), totalBatchNanos = new LongAdder();
     private volatile boolean enabled, closed, saving;
     private volatile Job active;
     private volatile LoadedScan scan; // Cursor belongs to the global region; only UUIDs/packed coordinates are retained.
+    private final AtomicReference<ScheduledTask> rescanTask = new AtomicReference<>();
 
     public BlockMarkerCleaner(Aurora plugin) { this.plugin = plugin; }
 
@@ -55,6 +62,9 @@ public final class BlockMarkerCleaner implements Listener {
     public boolean isScanning() { return isEnabled() && (scan != null || rescanRequested.get()); }
     public long getCheckedChunks() { return chunks.sum() + emptyChunks.sum(); }
     public long getNetRemovedKeys() { return legacy.sum() + clears.sum() + deleted.sum() - createdArchives.sum(); }
+    public long getExpiredMarkersDeleted() { return expiredDeleted.sum(); }
+    public long getLegacyShieldsCreated() { return legacyShields.sum(); }
+    public long getEmptyArchivesDeleted() { return emptyArchives.sum(); }
 
     public record Status(boolean enabled, int pendingChunks, long completedChunks, long compactedLegacyKeys,
                          long compactedClearKeys, long deletedKeys, long skippedKeys, long queueSkippedChunks,
@@ -80,6 +90,7 @@ public final class BlockMarkerCleaner implements Listener {
     }
 
     private void apply(boolean value) {
+        cancelRescan();
         enabled = value;
         if (!value) { cancelJobs(); return; }
         rescanRequested.set(false);
@@ -151,7 +162,7 @@ public final class BlockMarkerCleaner implements Listener {
 
     private void wake() {
         if (!isEnabled() || !wakePending.compareAndSet(false, true)) return;
-        Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
+        try { Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
             wakePending.set(false);
             if (!isEnabled()) return;
             fillQueue();
@@ -164,7 +175,29 @@ public final class BlockMarkerCleaner implements Listener {
                 break;
             }
             if (active == null && isScanning()) wake();
-        });
+            else if (active == null) scheduleRescan();
+        }); } catch (IllegalPluginAccessException stopped) {
+            wakePending.set(false);
+            if (isEnabled() && plugin.isEnabled()) throw stopped;
+        }
+    }
+
+    private void scheduleRescan() {
+        if (!isEnabled() || rescanTask.get() != null) return;
+        // This core keeps cancelled global delayed tasks (and their plugin) until the deadline.
+        // Native async cancellation drops the owner entry immediately; only flags cross back.
+        var task = Bukkit.getAsyncScheduler().runDelayed(plugin, completed -> {
+            if (!rescanTask.compareAndSet(completed, null) || !isEnabled()) return;
+            rescanRequested.set(true);
+            wake();
+        }, RESCAN_SECONDS, TimeUnit.SECONDS);
+        rescanTask.set(task);
+        if (!isEnabled()) cancelRescan();
+    }
+
+    private void cancelRescan() {
+        var task = rescanTask.getAndSet(null);
+        if (task != null) task.cancel();
     }
 
     private void schedule(Job job) {
@@ -185,18 +218,26 @@ public final class BlockMarkerCleaner implements Listener {
         long deadline = start + BATCH_NANOS;
         try {
             assert Bukkit.isOwnedByCurrentRegion(world, job.id.x(), job.id.z()) : "Cleaner chunk owner mismatch";
-            var data = world.getChunkAt(job.id.x(), job.id.z()).getPersistentDataContainer();
+            var chunk = world.getChunkAt(job.id.x(), job.id.z());
+            var data = chunk.getPersistentDataContainer();
             if (job.work == null) {
                 if (data.isEmpty()) { emptyChunks.increment(); finish(job); return; }
                 // The native getKeys call copies all keys. It cannot itself be split across ticks.
                 long snapshotStart = System.nanoTime();
-                job.work = new Work(data.getKeys());
+                var keys = data.getKeys();
+                // A name-only dependency inventory, not a scan of world blocks. Unknown legacy
+                // values also count: the public Location reader supports raw hashes.
+                job.work = new Work(keys, Work.hasLegacySources(keys));
                 maxSnapshotNanos.accumulateAndGet(System.nanoTime() - snapshotStart, Math::max);
             }
             // Use the remaining batch budget now, including on the first visit. Small chunks
             // need not wait a separate tick for each collection/commit/finish phase.
             for (int step = 0; step < MAX_STEPS_PER_BATCH && current(job) && System.nanoTime() < deadline; step++) {
-                if (job.work.step(data, deadline)) {
+                if (job.work.step(data, deadline, coordinate -> {
+                    int y = (int) (coordinate >> 8);
+                    return y >= world.getMinHeight() && y < world.getMaxHeight()
+                            && chunk.getBlock((int) (coordinate >> 4) & 15, y, (int) coordinate & 15).getType().isAir();
+                })) {
                     chunks.increment();
                     account(job);
                     finish(job);
@@ -230,12 +271,19 @@ public final class BlockMarkerCleaner implements Listener {
         legacy.add(job.work.legacy - job.countedLegacy); clears.add(job.work.clears - job.countedClears);
         deleted.add(job.work.deleted - job.countedDeleted); skipped.add(job.work.skipped - job.countedSkipped);
         createdArchives.add(job.work.createdArchives - job.countedArchives);
+        expiredDeleted.add(job.work.expiredDeleted - job.countedExpired);
+        legacyShields.add(job.work.legacyShields - job.countedShields);
+        emptyArchives.add(job.work.emptyArchives - job.countedEmptyArchives);
         job.countedLegacy = job.work.legacy; job.countedClears = job.work.clears;
         job.countedDeleted = job.work.deleted; job.countedSkipped = job.work.skipped;
         job.countedArchives = job.work.createdArchives;
+        job.countedExpired = job.work.expiredDeleted;
+        job.countedShields = job.work.legacyShields;
+        job.countedEmptyArchives = job.work.emptyArchives;
     }
 
     private void cancelJobs() {
+        cancelRescan();
         scan = null;
         rescanRequested.set(false);
         for (var job : jobs.values()) discard(job);
@@ -290,11 +338,13 @@ public final class BlockMarkerCleaner implements Listener {
     String statusMessage() {
         var s = status();
         String state = !s.enabled() ? "已暂停" : isScanning() || s.pendingChunks() > 0
-                ? "仍有区块待检查/处理" : "当前队列处理完毕";
-        return "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；发现可处理项即处理；等待区块 " + s.pendingChunks()
+                ? "仍有区块待检查/处理" : "当前队列处理完毕，30 秒后复查已加载区块";
+        return "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；边检查边清理；等待区块 " + s.pendingChunks()
                 + "\n&e检查完成 " + getCheckedChunks() + " 次（含空区块）；" + state
+                + "\n&a实际删除空气残留标记 " + getExpiredMarkersDeleted() + "；转为旧格式兼容屏蔽 " + getLegacyShieldsCreated() + " 次"
+                + "\n&a删除无用存储键 " + s.deletedKeys() + "（含空数组 " + getEmptyArchivesDeleted() + "）；存储项净减少 " + getNetRemovedKeys()
                 + "\n&a整理并移除旧存储项 " + (s.compactedLegacyKeys() + s.compactedClearKeys()) + "（原信息保留）"
-                + "\n&a直接删除无用记录 " + s.deletedKeys() + "；存储项净减少 " + getNetRemovedKeys()
+                + "\n&e无法确认失效的旧哈希保留，不计入空气残留删除"
                 + "\n&e区块卸载暂缓 " + unloaded.sum() + " 次（下次加载继续）；最高单批 "
                 + String.format(Locale.ROOT, "%.2f", s.maxBatchMillis()) + " ms";
     }
@@ -304,7 +354,13 @@ public final class BlockMarkerCleaner implements Listener {
         else Chat.sendMessage(sender, message);
     }
 
-    private record ChunkId(UUID world, int x, int z) {}
+    private record ChunkId(UUID world, int x, int z) {
+        // JDK 25's generated record equals adapter leaves a global soft reference to this
+        // plugin's class loader. Compare the same fields directly so hot unload can release it.
+        @Override public boolean equals(Object other) {
+            return other instanceof ChunkId id && x == id.x && z == id.z && Objects.equals(world, id.world);
+        }
+    }
     private static final class LoadedScan {
         final Iterator<UUID> worlds = Bukkit.getWorlds().stream().map(org.bukkit.World::getUID).toList().iterator();
         UUID world;
@@ -338,6 +394,7 @@ public final class BlockMarkerCleaner implements Listener {
         volatile ScheduledTask task;
         Work work; // Confined to this chunk's region callbacks.
         long countedLegacy, countedClears, countedDeleted, countedSkipped, countedArchives;
+        long countedExpired, countedShields, countedEmptyArchives;
         Job(ChunkId id) { this.id = id; }
     }
 
@@ -356,6 +413,7 @@ public final class BlockMarkerCleaner implements Listener {
     static final class Work {
         static final int KEYS_PER_STEP = 64;
         final Iterator<NamespacedKey> keys;
+        final boolean legacyPossible;
         final Map<NamespacedKey, Group> groups = new LinkedHashMap<>();
         final List<NamespacedKey> clearArchives = new ArrayList<>();
         Iterator<Group> committing;
@@ -364,17 +422,34 @@ public final class BlockMarkerCleaner implements Listener {
         boolean hasLegacy;
         boolean collecting = true;
         long legacy, clears, deleted, skipped, createdArchives;
+        long expiredDeleted, legacyShields, emptyArchives;
 
-        Work(Set<NamespacedKey> keys) { this.keys = keys.iterator(); }
+        Work(Set<NamespacedKey> keys) { this(keys, true); }
+
+        Work(Set<NamespacedKey> keys, boolean legacyPossible) {
+            this.keys = keys.iterator();
+            this.legacyPossible = legacyPossible;
+        }
+
+        static boolean hasLegacySources(Set<NamespacedKey> keys) {
+            return keys.stream().anyMatch(key -> CompactBlockMarkers.legacyHash(key) != null
+                    || CompactBlockMarkers.archiveIndex(key, CompactBlockMarkers.LEGACY) >= 0);
+        }
 
         boolean step(PersistentDataContainer data) {
             return step(data, System.nanoTime() + BATCH_NANOS);
         }
 
         boolean step(PersistentDataContainer data, long deadline) {
+            return step(data, deadline, coordinate -> false);
+        }
+
+        boolean step(PersistentDataContainer data, long deadline, LongPredicate isAir) {
             int touched = 0;
             if (committing == null) {
-                while (keys.hasNext() && touched++ < KEYS_PER_STEP) {
+                while (keys.hasNext() && touched < KEYS_PER_STEP
+                        && (touched == 0 || System.nanoTime() < deadline)) {
+                    touched++;
                     var key = keys.next();
                     Integer hash = CompactBlockMarkers.legacyHash(key);
                     if (hash != null) {
@@ -382,15 +457,42 @@ public final class BlockMarkerCleaner implements Listener {
                         if (matches(data, key, (byte) 1)) collect(data, CompactBlockMarkers.LEGACY[CompactBlockMarkers.bucket(hash)], true, key, hash);
                         else skipped++;
                     } else if (CompactBlockMarkers.archiveIndex(key, CompactBlockMarkers.LEGACY) >= 0) {
+                        if (data.has(key, PersistentDataType.INTEGER_ARRAY)
+                                && data.get(key, PersistentDataType.INTEGER_ARRAY).length == 0) {
+                            data.remove(key); deleted++; emptyArchives++;
+                            continue;
+                        }
                         hasLegacy |= !data.has(key, PersistentDataType.INTEGER_ARRAY)
                                 || data.get(key, PersistentDataType.INTEGER_ARRAY).length > 0;
                     } else if (CompactBlockMarkers.archiveIndex(key, CompactBlockMarkers.CLEARED) >= 0) {
+                        if (data.has(key, PersistentDataType.LONG_ARRAY)
+                                && data.get(key, PersistentDataType.LONG_ARRAY).length == 0) {
+                            data.remove(key); deleted++; emptyArchives++;
+                            continue;
+                        }
+                        if (!legacyPossible && data.has(key, PersistentDataType.LONG_ARRAY)) {
+                            data.remove(key); deleted++;
+                            continue;
+                        }
                         if (data.has(key, PersistentDataType.LONG_ARRAY)) clearArchives.add(key);
                         else skipped++;
                     } else {
                         Long coordinate = CompactBlockMarkers.clearCoordinate(key);
-                        if (coordinate != null && matches(data, key, (byte) 0))
-                            collect(data, CompactBlockMarkers.CLEARED[(int) (long) coordinate & 255], false, key, coordinate);
+                        if (coordinate != null && matches(data, key, (byte) 1) && isAir.test(coordinate)
+                                && matches(data, key, (byte) 1)) {
+                            if (!legacyPossible || CompactBlockMarkers.isCleared(data, coordinate)) {
+                                data.remove(key); deleted++; expiredDeleted++;
+                                continue; // Remove before checking another key, not at the end of the scan.
+                            }
+                            // Removing this override could resurrect an old integer or raw Location
+                            // hash. Cancel the stale placement state but retain its required shield.
+                            data.set(key, PersistentDataType.BYTE, (byte) 0);
+                            legacyShields++;
+                        }
+                        if (coordinate != null && matches(data, key, (byte) 0)) {
+                            if (!legacyPossible) { data.remove(key); deleted++; }
+                            else collect(data, CompactBlockMarkers.CLEARED[(int) (long) coordinate & 255], false, key, coordinate);
+                        }
                     }
                     if (System.nanoTime() >= deadline) break;
                 }
