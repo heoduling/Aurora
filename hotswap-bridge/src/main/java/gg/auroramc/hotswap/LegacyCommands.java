@@ -1,10 +1,12 @@
 package gg.auroramc.hotswap;
 
 import org.bukkit.Bukkit;
+import org.bukkit.command.PluginIdentifiableCommand;
 import org.bukkit.help.GenericCommandHelpTopic;
 import org.bukkit.help.HelpTopic;
 import org.bukkit.help.IndexHelpTopic;
 import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
 
 import java.lang.ref.Reference;
 import java.util.*;
@@ -66,8 +68,13 @@ final class LegacyCommands {
             var topics = (Map<String, HelpTopic>) Access.get(help, "helpTopics");
             var removed = Collections.newSetFromMap(new IdentityHashMap<HelpTopic, Boolean>());
             for (var topic : topics.values()) {
-                if (owned(topic.getClass().getClassLoader(), owners)
-                        || topic instanceof GenericCommandHelpTopic && owned(Access.get(topic, "command").getClass().getClassLoader(), owners)) removed.add(topic);
+                if (owned(topic.getClass().getClassLoader(), owners)) removed.add(topic);
+                else if (topic instanceof GenericCommandHelpTopic) {
+                    var command = Access.get(topic, "command");
+                    if (owned(command.getClass().getClassLoader(), owners)
+                            || command instanceof PluginIdentifiableCommand pluginCommand
+                            && owned(pluginCommand.getPlugin().getClass().getClassLoader(), owners)) removed.add(topic);
+                }
             }
             var indexes = new ArrayList<>(topics.values());
             indexes.add((HelpTopic) Access.get(help, "defaultTopic"));
@@ -75,6 +82,24 @@ final class LegacyCommands {
             for (var topic : indexes) if (topic instanceof IndexHelpTopic) {
                 ((Collection<HelpTopic>) Access.get(topic, "allTopics")).removeIf(removed::contains);
             }
+        }
+    }
+    @SuppressWarnings("unchecked") static void registerHelperHelp(JavaPlugin current) throws ReflectiveOperationException {
+        var owners = new HashSet<ClassLoader>();
+        for (var topic : Bukkit.getHelpMap().getHelpTopics()) if (topic instanceof GenericCommandHelpTopic) {
+            var command = Access.get(topic, "command");
+            if (command instanceof PluginIdentifiableCommand pluginCommand) {
+                var plugin = pluginCommand.getPlugin();
+                if (plugin != current && plugin.getName().equals(current.getName()) && !plugin.isEnabled()) {
+                    owners.add(plugin.getClass().getClassLoader());
+                }
+            }
+        }
+        if (!owners.isEmpty()) clearHelp(owners);
+        var help = new GenericCommandHelpTopic(Objects.requireNonNull(current.getCommand("aurorahotswap")));
+        Bukkit.getHelpMap().addTopic(help);
+        if (Bukkit.getHelpMap().getHelpTopic(current.getName()) instanceof IndexHelpTopic index) {
+            ((Collection<HelpTopic>) Access.get(index, "allTopics")).add(help);
         }
     }
     private static boolean owned(ClassLoader loader, Set<ClassLoader> owners) { return loader != null && owners.contains(loader); }

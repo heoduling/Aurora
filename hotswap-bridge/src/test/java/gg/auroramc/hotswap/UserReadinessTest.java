@@ -25,11 +25,11 @@ class UserReadinessTest {
         assertEquals(UserReadiness.WAITING, UserReadiness.classify(false, false, false, true));
     }
 
-    @Test void loadedOfflineDataMustWaitForQuitCleanupEvenWhenClean() {
-        assertEquals(UserReadiness.WAITING, UserReadiness.classify(false, true, true, false));
+    @Test void loadedOfflineDataIsSavedEvenWhenClean() {
+        assertEquals(UserReadiness.READY, UserReadiness.classify(false, true, true, false));
     }
 
-    @Test void dirtyLoadedOfflineDataMustWaitForQuitCleanup() {
-        assertEquals(UserReadiness.WAITING, UserReadiness.classify(false, true, true, true));
+    @Test void dirtyLoadedOfflineDataIsSaved() {
+        assertEquals(UserReadiness.READY, UserReadiness.classify(false, true, true, true));
     }
 }

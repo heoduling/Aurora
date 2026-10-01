@@ -41,6 +41,8 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
     @Override public void onEnable() {
         try { Files.createDirectories(getDataFolder().toPath().resolve("incoming")); }
         catch (IOException e) { throw new IllegalStateException(e); }
+        try { LegacyCommands.registerHelperHelp(this); }
+        catch (ReflectiveOperationException e) { throw new IllegalStateException("Unsupported command help registry", e); }
         Bukkit.getPluginManager().registerEvents(this, this);
         guardCurrent();
         guard(this);
@@ -49,6 +51,8 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
         failed = true;
         for (var plugin : guarded) removeGuard(plugin);
         guarded.clear();
+        try { LegacyCommands.clearHelp(Set.of(getClass().getClassLoader())); }
+        catch (ReflectiveOperationException e) { throw new IllegalStateException("Could not retire helper command help", e); }
     }
     @SuppressWarnings("unchecked") private void removeGuard(Plugin plugin) {
         try {
@@ -176,6 +180,7 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
         private Plugin aurora, quests;
         private Path oldAurora, oldQuests, stagedAurora, stagedQuests, archive;
         private Object users, boards;
+        private final Map<UUID, Object> readyUsers = new HashMap<>();
         private Class<?> menuClass;
         private List<Player> players;
         private Set<ThreadPoolExecutor> metrics;
@@ -280,11 +285,14 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
                     boolean configured = (!isOnline || !loaded) && Access.call(entry.getValue(), "getConfiguration") != null;
                     boolean dirty = (!isOnline || !loaded) && (boolean) Access.call(entry.getValue(), "isDirty");
                     var state = UserReadiness.classify(isOnline, loaded, configured, dirty);
+                    // Keep actual loaded objects if a concurrent legacy quit later removes its cache entry.
+                    if (loaded) readyUsers.put(entry.getKey(), entry.getValue());
                     if (state == UserReadiness.EMPTY_OFFLINE_PLACEHOLDER) placeholders++;
                     else if (state == UserReadiness.WAITING) pending.add(online.getOrDefault(entry.getKey(), "offline")
                             + " [" + entry.getKey() + ", online=" + isOnline + ", loaded=" + loaded
                             + ", configured=" + configured + ", dirty=" + dirty + "]");
                 }
+                pending.addAll(pendingUserIo());
                 if (pending.isEmpty()) {
                     if (placeholders != 0) getLogger().info("Ignoring " + placeholders + " empty offline placeholders; they will not be saved");
                     return;
@@ -298,6 +306,34 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
                     nextNotice = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                 }
                 Thread.sleep(100); // Bounded command-only wait on the async worker; tick threads keep running.
+            }
+        }
+        private List<String> pendingUserIo() throws Exception {
+            var pending = new ArrayList<String>();
+            try {
+                int active = (int) Access.call(users, "getActiveOperations");
+                if (active != 0) pending.add("tracked player operations=" + active);
+            } catch (NoSuchMethodException legacy) { }
+            // Includes this tested core's virtual region threads, which Thread.getAllStackTraces omits.
+            for (var thread : LegacyCommands.threads()) {
+                for (var frame : thread.getStackTrace()) if (LegacyUserIo.active(frame)) {
+                    pending.add(thread.getName() + " at " + frame.getClassName() + "." + frame.getMethodName());
+                    break;
+                }
+            }
+            return pending;
+        }
+        private void awaitUserIo() throws Exception {
+            long nextNotice = 0;
+            while (true) {
+                check();
+                var pending = pendingUserIo();
+                if (pending.isEmpty()) return;
+                if (System.nanoTime() >= nextNotice) {
+                    getLogger().info("Waiting for actual player IO: " + pending.stream().limit(8).collect(java.util.stream.Collectors.joining("; ")));
+                    nextNotice = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                }
+                Thread.sleep(100);
             }
         }
         private void validateLegacy(Plugin plugin, Path path, Set<String> legacyHashes) throws Exception {
@@ -453,23 +489,41 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
             getLogger().info("Drained command contexts: " + clearedContexts);
             // Preserve loaded holders exactly as they are. Never migrate schemas, erase task records, or touch world data.
             status = "Saving progress";
-            var loadedUsers = new ArrayList<Object>();
             for (var user : cachedUsers()) {
-                if ((boolean) Access.call(user, "isLoaded")) loadedUsers.add(user);
+                if ((boolean) Access.call(user, "isLoaded")) readyUsers.put(uuid(user), user);
                 else if (players.stream().anyMatch(p -> p.getUniqueId().equals(uuid(user))) || !emptyPlaceholder(user)) {
                     throw new IllegalStateException("Unloaded player data changed during preparation: " + uuid(user));
                 }
             }
             var saveReason = Class.forName("gg.auroramc.aurora.api.user.storage.SaveReason", true, aurora.getClass().getClassLoader()).getField("QUIT").get(null);
             var storage = Access.get(users, "storage");
-            int count = (int) Access.call(storage, "bulkSaveUsers", loadedUsers, saveReason);
-            if (count != loadedUsers.size()) throw new IllegalStateException("Storage saved " + count + "/" + loadedUsers.size() + " players");
-            Map<UUID, Collection<String>> dirty = new HashMap<>();
-            for (var user : loadedUsers) dirty.put(uuid(user), ((Map<String, ?>) Access.call(user, "getDirtyLeaderboards")).keySet());
-            waitFor((CompletableFuture<?>) Access.call(boards, "bulkUpdateUsers", dirty));
-            Access.call(storage, "dispose");
             var boardStorage = Access.get(boards, "storage");
-            if (boardStorage != storage) Access.call(boardStorage, "dispose");
+            // Volatile storage fields fence queued legacy futures. Already-entered IO must finish first.
+            Access.set(users, "storage", blockedProxy("gg.auroramc.aurora.api.user.storage.UserStorage"));
+            try {
+                awaitUserIo();
+                for (var user : cachedUsers()) if ((boolean) Access.call(user, "isLoaded")) readyUsers.put(uuid(user), user);
+                restoreReadyUsers();
+                var loadedUsers = new ArrayList<>(readyUsers.values());
+                for (var user : loadedUsers) if (!(boolean) Access.call(user, "isLoaded")) {
+                    throw new IllegalStateException("Previously loaded player data became unloaded: " + uuid(user));
+                }
+                int count = (int) Access.call(storage, "bulkSaveUsers", loadedUsers, saveReason);
+                if (count != loadedUsers.size()) throw new IllegalStateException("Storage saved " + count + "/" + loadedUsers.size() + " players");
+                getLogger().info("Saved loaded player data: " + count + " (including offline records)");
+                Map<UUID, Collection<String>> dirty = new HashMap<>();
+                for (var user : loadedUsers) dirty.put(uuid(user), ((Map<String, ?>) Access.call(user, "getDirtyLeaderboards")).keySet());
+                waitFor((CompletableFuture<?>) Access.call(boards, "bulkUpdateUsers", dirty));
+                Access.set(boards, "storage", blockedProxy("gg.auroramc.aurora.expansions.leaderboard.storage.LeaderboardStorage"));
+                awaitUserIo();
+                Access.call(storage, "dispose");
+                if (boardStorage != storage) Access.call(boardStorage, "dispose");
+            } catch (Exception failure) {
+                Access.set(users, "storage", storage);
+                Access.set(boards, "storage", boardStorage);
+                restoreReadyUsers(); // A failed save must still leave the real loaded data available for shutdown/retry.
+                throw failure;
+            }
             // The unchanged originals synchronously save in onDisable. After a verified save+close, avoid duplicate IO on a tick thread.
             Access.set(users, "storage", disposedProxy(storage, "gg.auroramc.aurora.api.user.storage.UserStorage"));
             Access.set(boards, "storage", disposedProxy(boardStorage, "gg.auroramc.aurora.expansions.leaderboard.storage.LeaderboardStorage"));
@@ -503,6 +557,20 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
                 }
                 if (!ready) throw new IllegalStateException("Online player data was not restored: " + player.getUniqueId());
             }
+        }
+        @SuppressWarnings("unchecked") private void restoreReadyUsers() throws Exception {
+            var cache = (ConcurrentMap<UUID, Object>) Access.call(Access.get(users, "cache"), "asMap");
+            for (var entry : readyUsers.entrySet()) {
+                var current = cache.putIfAbsent(entry.getKey(), entry.getValue());
+                if (current != null && emptyPlaceholder(current)) cache.replace(entry.getKey(), current, entry.getValue());
+            }
+        }
+        private Object blockedProxy(String iface) throws Exception {
+            var type = Class.forName(iface, true, aurora.getClass().getClassLoader());
+            return Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, (proxy, method, args) -> {
+                if (method.getName().equals("toString")) return "AuroraHotSwap is draining player IO";
+                throw new IllegalStateException("Player storage is quiescing: " + method.getName());
+            });
         }
         private Object disposedProxy(Object storage, String iface) throws Exception {
             var type = Class.forName(iface, true, aurora.getClass().getClassLoader());

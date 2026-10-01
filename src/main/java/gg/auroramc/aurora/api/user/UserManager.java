@@ -116,7 +116,7 @@ public class UserManager implements Listener {
     public boolean saveUserData(AuroraUser user, SaveReason reason) {
         synchronized (getPlayerLock(user.getUniqueId())) {
             var result = storage.saveUser(user, reason);
-            if (reason == SaveReason.QUIT && !Bukkit.isStopping() && !Aurora.isDisabling()) {
+            if (result && reason == SaveReason.QUIT && !Bukkit.isStopping() && !Aurora.isDisabling()) {
                 Aurora.logger().debug("Saved user " + user.getUniqueId() + " into storage");
                 Bukkit.getGlobalRegionScheduler().run(Aurora.getInstance(),
                         (task) -> Bukkit.getPluginManager().callEvent(new AuroraUserUnloadedEvent(user)));
@@ -267,6 +267,14 @@ public class UserManager implements Listener {
         track(CompletableFuture.runAsync(() -> {
             if (closing) { loading.remove(uuid); return; }
             synchronized (getPlayerLock(uuid)) {
+                var retained = cache.getIfPresent(uuid);
+                if (retained != null && retained.isLoaded() && Bukkit.getPlayer(uuid) != null) {
+                    // A failed or unfinished quit still owns the latest data; a rejoin must not replace it from storage.
+                    loading.remove(uuid);
+                    Bukkit.getGlobalRegionScheduler().run(Aurora.getInstance(),
+                            (task) -> { if (!closing) Bukkit.getPluginManager().callEvent(new AuroraUserLoadedEvent(retained)); });
+                    return;
+                }
                 var lbm = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
 
                 storage.loadUser(uuid, dataHolders, user -> {
@@ -350,16 +358,30 @@ public class UserManager implements Listener {
         if (user == null) return;
         track(CompletableFuture.supplyAsync(() -> {
             var lbm = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
-            lbm.updateUser(user, Collections.emptyList()).join();
+            try {
+                lbm.updateUser(user, Collections.emptyList()).join();
+            } catch (Exception failure) {
+                Aurora.getInstance().getLogger().log(java.util.logging.Level.SEVERE,
+                        "Failed to update leaderboards for quitting user " + user.getUniqueId() + "; still saving player data", failure);
+            }
             return saveUserData(user, SaveReason.QUIT);
         }).thenAcceptAsync(success -> {
-            if (user.getPlayer() == null || !user.getPlayer().isOnline()) {
+            if (!success) {
+                Aurora.getInstance().getLogger().severe("Failed to save quitting user " + user.getUniqueId() + "; retaining cached data for retry");
+                return;
+            }
+            var currentPlayer = user.getPlayer();
+            if (currentPlayer == null || !currentPlayer.isOnline()) {
+                if (!cache.asMap().remove(user.getUniqueId(), user)) return;
                 Aurora.logger().debug("Removed user " + user.getUniqueId() + " from cache");
                 playerLocks.remove(user.getUniqueId());
-                cache.invalidate(player.getUniqueId());
             } else {
                 Aurora.logger().debug("Failed to remove user " + user.getUniqueId() + " from cache, because player is still online");
             }
+        }).exceptionally(failure -> {
+            Aurora.getInstance().getLogger().log(java.util.logging.Level.SEVERE,
+                    "Failed to persist quitting user " + user.getUniqueId() + "; retaining cached data for retry", failure);
+            return null;
         }));
     }
 
