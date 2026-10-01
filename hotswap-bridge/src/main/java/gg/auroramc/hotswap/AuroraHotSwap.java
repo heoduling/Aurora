@@ -219,7 +219,6 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
                 players = new ArrayList<>(Bukkit.getOnlinePlayers());
             }));
             oldAurora = findActive(aurora); oldQuests = findActive(quests);
-            for (var player : players) LegacyEntityTasks.validate(player);
             collectHandlers(oldAurora, aurora); collectHandlers(oldQuests, quests);
             for (var list : ownedHandlers) for (var listener : list.getRegisteredListeners()) {
                 if (listener.getPlugin() != aurora && listener.getPlugin() != quests) throw new IllegalStateException("An external listener uses Aurora events: " + listener.getPlugin().getName());
@@ -233,9 +232,6 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
             boards = Access.call(Access.call(aurora.getClass(), "getExpansionManager"), "getExpansion", Class.forName("gg.auroramc.aurora.expansions.leaderboard.LeaderboardExpansion", true, aurora.getClass().getClassLoader()));
             if ((boolean) Access.call(Access.get(users, "migrator"), "isMigrating")) throw new IllegalStateException("A storage migration is running");
             menuClass = Class.forName("gg.auroramc.aurora.api.menu.AuroraMenu", true, aurora.getClass().getClassLoader());
-            for (var user : cachedUsers()) if (!(boolean) Access.call(user, "isLoaded") || !players.stream().anyMatch(p -> p.getUniqueId().equals(uuid(user)))) {
-                throw new IllegalStateException("A player load/quit is still pending; retry when it finishes");
-            }
             var incoming = getDataFolder().toPath().resolve("incoming").toRealPath();
             Path nextA = incoming.resolve("Aurora.jar").toRealPath(), nextQ = incoming.resolve("AuroraQuests.jar").toRealPath();
             if (!nextA.getParent().equals(incoming) || !nextQ.getParent().equals(incoming)) throw new IllegalStateException("Replacement path escaped incoming directory");
@@ -250,7 +246,59 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
             // DriverManager and untracked JDBC executors must not retain a private legacy library loader.
             verifyJdbcOwnership();
             verifyMythicCaches();
+            awaitReadyUsers();
+            for (var player : players) LegacyEntityTasks.validate(player);
             getLogger().info("Preflight passed: " + Bukkit.getVersion() + "; " + aurora.getDescription().getVersion() + "/" + quests.getDescription().getVersion() + "; bStats executors=" + metrics.size());
+        }
+
+        private boolean emptyPlaceholder(Object user) throws Exception {
+            // Clean unloaded users with no configuration have no loaded changes to persist.
+            return !(boolean) Access.call(user, "isLoaded") && Access.call(user, "getConfiguration") == null
+                    && !(boolean) Access.call(user, "isDirty");
+        }
+
+        private void awaitReadyUsers() throws Exception {
+            long until = Math.min(deadline, System.nanoTime() + TimeUnit.SECONDS.toNanos(30));
+            long nextNotice = 0;
+            while (true) {
+                check();
+                var online = new HashMap<UUID, String>();
+                waitFor(global(() -> {
+                    players = new ArrayList<>(Bukkit.getOnlinePlayers());
+                    for (var player : players) online.put(player.getUniqueId(), player.getName());
+                }));
+                var cached = new HashMap<UUID, Object>();
+                for (var user : cachedUsers()) cached.put(uuid(user), user);
+                var pending = new ArrayList<String>();
+                int placeholders = 0;
+                for (var entry : online.entrySet()) if (!cached.containsKey(entry.getKey())) {
+                    pending.add(entry.getValue() + " [" + entry.getKey() + ", online=true, cached=false]");
+                }
+                for (var entry : cached.entrySet()) {
+                    boolean isOnline = online.containsKey(entry.getKey());
+                    boolean loaded = (boolean) Access.call(entry.getValue(), "isLoaded");
+                    boolean configured = (!isOnline || !loaded) && Access.call(entry.getValue(), "getConfiguration") != null;
+                    boolean dirty = (!isOnline || !loaded) && (boolean) Access.call(entry.getValue(), "isDirty");
+                    var state = UserReadiness.classify(isOnline, loaded, configured, dirty);
+                    if (state == UserReadiness.EMPTY_OFFLINE_PLACEHOLDER) placeholders++;
+                    else if (state == UserReadiness.WAITING) pending.add(online.getOrDefault(entry.getKey(), "offline")
+                            + " [" + entry.getKey() + ", online=" + isOnline + ", loaded=" + loaded
+                            + ", configured=" + configured + ", dirty=" + dirty + "]");
+                }
+                if (pending.isEmpty()) {
+                    if (placeholders != 0) getLogger().info("Ignoring " + placeholders + " empty offline placeholders; they will not be saved");
+                    return;
+                }
+                String detail = pending.stream().limit(8).collect(java.util.stream.Collectors.joining("; "))
+                        + (pending.size() > 8 ? "; total=" + pending.size() : "");
+                if (System.nanoTime() >= until) throw new IllegalStateException("Player data did not become ready within 30s: " + detail);
+                if (System.nanoTime() >= nextNotice) {
+                    status = "Waiting for player data: " + detail;
+                    getLogger().info(status);
+                    nextNotice = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                }
+                Thread.sleep(100); // Bounded command-only wait on the async worker; tick threads keep running.
+            }
         }
         private void validateLegacy(Plugin plugin, Path path, Set<String> legacyHashes) throws Exception {
             try { plugin.getClass().getMethod("beginHotUnload"); }
@@ -357,8 +405,14 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
         private void run() throws Exception {
             retired.removeIf(reference -> reference.get() == null);
             retiredPlugins.removeIf(reference -> reference.get() == null);
-            committed = true; status = "Preparing old plugins";
+            status = "Preparing old plugins";
             waitFor(global(() -> {
+                var expected = new HashSet<UUID>();
+                for (var player : players) expected.add(player.getUniqueId());
+                var current = new HashSet<UUID>();
+                for (var player : Bukkit.getOnlinePlayers()) current.add(player.getUniqueId());
+                if (!expected.equals(current)) throw new IllegalStateException("Online players changed after preflight; retry when logins/quits finish");
+                committed = true;
                 Access.set(aurora.getClass(), "disabling", true); Access.set(quests, "loaded", false);
                 try { Access.call(aurora, "beginHotUnload"); Access.call(quests, "beginHotUnload"); } catch (NoSuchMethodException legacy) { }
                 HandlerList.unregisterAll(quests); HandlerList.unregisterAll(aurora);
@@ -399,7 +453,13 @@ public final class AuroraHotSwap extends JavaPlugin implements Listener {
             getLogger().info("Drained command contexts: " + clearedContexts);
             // Preserve loaded holders exactly as they are. Never migrate schemas, erase task records, or touch world data.
             status = "Saving progress";
-            var loadedUsers = cachedUsers();
+            var loadedUsers = new ArrayList<Object>();
+            for (var user : cachedUsers()) {
+                if ((boolean) Access.call(user, "isLoaded")) loadedUsers.add(user);
+                else if (players.stream().anyMatch(p -> p.getUniqueId().equals(uuid(user))) || !emptyPlaceholder(user)) {
+                    throw new IllegalStateException("Unloaded player data changed during preparation: " + uuid(user));
+                }
+            }
             var saveReason = Class.forName("gg.auroramc.aurora.api.user.storage.SaveReason", true, aurora.getClass().getClassLoader()).getField("QUIT").get(null);
             var storage = Access.get(users, "storage");
             int count = (int) Access.call(storage, "bulkSaveUsers", loadedUsers, saveReason);

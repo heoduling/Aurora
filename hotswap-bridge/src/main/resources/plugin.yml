@@ -1,5 +1,5 @@
 name: AuroraHotSwap
-version: '1.0.0'
+version: '1.0.0-1'
 main: gg.auroramc.hotswap.AuroraHotSwap
 api-version: '26.2'
 folia-supported: true
