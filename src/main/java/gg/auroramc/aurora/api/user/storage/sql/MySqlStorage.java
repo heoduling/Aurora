@@ -495,6 +495,10 @@ public class MySqlStorage implements UserStorage, LeaderboardStorage {
 
     @Override
     public void bulkUpdateEntries(Map<UUID, Set<BoardValue>> values) {
+        bulkUpdateEntries(values, false);
+    }
+
+    public void bulkUpdateEntries(Map<UUID, Set<BoardValue>> values, boolean strict) {
         String query = "INSERT INTO " + leaderboardTableName + " (player_uuid, name, board, value) " +
                 "VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE value = ?, name = ?";
 
@@ -532,6 +536,7 @@ public class MySqlStorage implements UserStorage, LeaderboardStorage {
                 ps.executeBatch();
             }
         } catch (SQLException e) {
+            if (strict) throw new IllegalStateException("Failed to save leaderboard data before hot unload", e);
             e.printStackTrace();
         }
     }

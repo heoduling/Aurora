@@ -19,6 +19,7 @@ public class MenuRefresher {
     }
 
     public void add(AuroraMenu menu) {
+        if (Aurora.isDisabling()) return;
         menus.add(menu);
         if(refreshTask == null || refreshTask.isCancelled()) {
             refreshTask = Bukkit.getAsyncScheduler().runAtFixedRate(plugin, (task) -> {
@@ -36,5 +37,10 @@ public class MenuRefresher {
             refreshTask.cancel();
             refreshTask = null;
         }
+    }
+
+    public void stopRefreshing() {
+        if (refreshTask != null) { refreshTask.cancel(); refreshTask = null; }
+        menus.clear();
     }
 }

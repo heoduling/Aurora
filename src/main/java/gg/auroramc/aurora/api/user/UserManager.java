@@ -171,6 +171,10 @@ public class UserManager implements Listener {
     }
 
     public <T extends UserDataHolder> void registerUserDataHolder(Class<T> clazz) {
+        // A newly loaded plugin's Class differs from its retired version even with the same name.
+        for (var previous : dataHolders) {
+            if (previous != clazz && previous.getName().equals(clazz.getName())) detachDataHolders(previous.getClassLoader());
+        }
         if (!dataHolders.add(clazz)) return;
         // A dependent plugin may be enabled after Aurora has restored online users.
         for (var user : cache.asMap().values()) {
@@ -194,9 +198,51 @@ public class UserManager implements Listener {
         if (leaderboardUpdateTask != null) leaderboardUpdateTask.cancel();
     }
 
+    public List<AuroraUser> getLoadedUsers() {
+        return cache.asMap().values().stream().filter(AuroraUser::isLoaded).toList();
+    }
+
+    public boolean hasUnreadyOnlineUsers() {
+        return Bukkit.getOnlinePlayers().stream().anyMatch(player -> {
+            var user = cache.getIfPresent(player.getUniqueId());
+            return user == null || !user.isLoaded();
+        });
+    }
+
+    public void detachDataHolders(ClassLoader owner) {
+        for (var user : cache.asMap().values()) user.detachData(owner);
+        dataHolders.removeIf(type -> type.getClassLoader() == owner);
+    }
+
+    public void resumeAfterHotUnload() {
+        closing = false;
+        autoSaveTask();
+        leaderboardUpdateTask();
+        loadOnlinePlayers();
+    }
+
+    public void saveForHotUnload() {
+        var users = getLoadedUsers();
+        int count = storage.bulkSaveUsers(users, SaveReason.QUIT);
+        if (count != users.size()) throw new IllegalStateException("Player storage saved " + count + "/" + users.size() + " records");
+        var dirty = new HashMap<UUID, Collection<String>>();
+        for (var user : users) dirty.put(user.getUniqueId(), new ArrayList<>(user.getDirtyLeaderboards().keySet()));
+        Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class).saveForHotUnload(dirty).join();
+        Aurora.getInstance().getLogger().info("Saved loaded player data before hot unload: " + count);
+    }
+
     public int getActiveLoads() { return loading.size(); }
 
     public int getActiveOperations() { return operations.size(); }
+
+    public boolean isSaveTaskRunning() {
+        return running(autoSaveTask) || running(leaderboardUpdateTask);
+    }
+
+    private static boolean running(ScheduledTask task) {
+        return task != null && (task.getExecutionState() == ScheduledTask.ExecutionState.RUNNING
+                || task.getExecutionState() == ScheduledTask.ExecutionState.CANCELLED_RUNNING);
+    }
 
     private <T> CompletableFuture<T> track(CompletableFuture<T> future) {
         operations.add(future);

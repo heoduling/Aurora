@@ -99,6 +99,18 @@ public class AuroraUser {
         }
     }
 
+    /** Keep the serialized data, but release a dependent plugin's classes and live objects. */
+    public void detachData(ClassLoader owner) {
+        synchronized (serializeLock) {
+            if (isLoaded() && configuration == null) configuration = new YamlConfiguration();
+            dataHolderMap.entrySet().removeIf(entry -> {
+                if (entry.getKey().getClassLoader() != owner) return false;
+                if (isLoaded()) entry.getValue().serializeInto(getOrCreateSection(entry.getValue().getId().toString()));
+                return true;
+            });
+        }
+    }
+
     public <T extends DataHolder> T getData(Class<T> holderClass) {
         // Refresh access timer
         Aurora.getUserManager().isUserCached(uuid);

@@ -28,6 +28,7 @@ import gg.auroramc.aurora.expansions.worldguard.WorldGuardExpansion;
 import gg.auroramc.aurora.hooks.LuckPermsHook;
 import gg.auroramc.aurora.hooks.MythicMobsHook;
 import gg.auroramc.aurora.hooks.WildToolsHook;
+import gg.auroramc.aurora.lifecycle.HotReload;
 import lombok.Getter;
 import lombok.Setter;
 import net.kyori.adventure.text.minimessage.MiniMessage;
@@ -51,6 +52,9 @@ public final class Aurora extends JavaPlugin implements Listener {
     @Getter
     private CommandManager commandManager;
     private Metrics metrics;
+    @Getter
+    private HotReload hotReload;
+    private boolean hotUnloadSaved;
 
     @Getter
     private static final MiniMessage miniMessage = MiniMessage.miniMessage();
@@ -72,7 +76,8 @@ public final class Aurora extends JavaPlugin implements Listener {
     @Getter
     private static LocalizationProvider localizationProvider;
     @Getter
-    private static boolean disabling = false;
+    @Setter
+    private static volatile boolean disabling = false;
 
     private static final AuroraLogger l = new AuroraLogger();
 
@@ -118,6 +123,9 @@ public final class Aurora extends JavaPlugin implements Listener {
 
     @Override
     public void onEnable() {
+        disabling = false;
+        hotUnloadSaved = false;
+        hotReload = new HotReload(this);
         // Plugins who wish to override languageProvider, should do it in their onLoad lifecycle method.
         localizationProvider = new LocalizationProvider(languageProvider);
 
@@ -147,7 +155,7 @@ public final class Aurora extends JavaPlugin implements Listener {
             runInSafeMode(() -> MythicMobsHook.hook(), "Failed to hook into MythicMobs.");
         }
 
-        commandManager.reload();
+        hotReload.changeCommands(commandManager::reload);
 
         userManager.loadOnlinePlayers();
         metrics = new Metrics(this, 23780);
@@ -172,15 +180,22 @@ public final class Aurora extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         disabling = true;
+        if (hotReload != null) hotReload.close();
         if (DependencyManager.hasDep("LuckPerms")) LuckPermsHook.close();
         if (metrics != null) { metrics.shutdown(); metrics = null; }
         var placeholders = expansionManager.getExpansion(PlaceholderExpansion.class);
         if (placeholders != null) placeholders.dispose();
         var region = expansionManager.getExpansion(RegionExpansion.class);
         if (region != null && region.getCleaner() != null) region.getCleaner().close();
-        userManager.stopTasksAndSaveAllData(true);
-        expansionManager.getExpansion(LeaderboardExpansion.class).dispose();
+        var worldGuard = expansionManager.getExpansion(WorldGuardExpansion.class);
+        if (worldGuard != null) worldGuard.dispose();
+        if (!hotUnloadSaved) {
+            userManager.stopTasksAndSaveAllData(true);
+            expansionManager.getExpansion(LeaderboardExpansion.class).dispose();
+        }
     }
+
+    public void markHotUnloadSaved() { hotUnloadSaved = true; }
 
     /** Called by the paired hot-swap coordinator while this plugin is still enabled. */
     public void beginHotUnload() {

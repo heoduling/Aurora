@@ -217,6 +217,10 @@ public class SqliteLeaderboardStorage implements LeaderboardStorage {
 
     @Override
     public void bulkUpdateEntries(Map<UUID, Set<BoardValue>> values) {
+        bulkUpdateEntries(values, false);
+    }
+
+    public void bulkUpdateEntries(Map<UUID, Set<BoardValue>> values, boolean strict) {
         String query = "INSERT INTO aurora_leaderboard (player_uuid, name, board, value) " +
                 "VALUES (?, ?, ?, ?) ON CONFLICT(player_uuid, board) DO UPDATE SET value = ?, name = ?";
 
@@ -253,6 +257,7 @@ public class SqliteLeaderboardStorage implements LeaderboardStorage {
                 ps.executeBatch();
             }
         } catch (SQLException e) {
+            if (strict) throw new IllegalStateException("Failed to save leaderboard data before hot unload", e);
             e.printStackTrace();
         }
     }

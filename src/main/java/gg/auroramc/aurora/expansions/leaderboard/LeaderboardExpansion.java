@@ -177,6 +177,14 @@ public class LeaderboardExpansion implements AuroraExpansion, Listener {
     }
 
     public CompletableFuture<Void> bulkUpdateUsers(Map<UUID, Collection<String>> data) {
+        return bulkUpdateUsers(data, false);
+    }
+
+    public CompletableFuture<Void> saveForHotUnload(Map<UUID, Collection<String>> data) {
+        return bulkUpdateUsers(data, true);
+    }
+
+    private CompletableFuture<Void> bulkUpdateUsers(Map<UUID, Collection<String>> data, boolean strict) {
         return CompletableFuture.runAsync(() -> {
             var toUpdate = new HashMap<UUID, Set<BoardValue>>(data.size());
             for (var entry : data.entrySet()) {
@@ -197,7 +205,10 @@ public class LeaderboardExpansion implements AuroraExpansion, Listener {
                 }
             }
             if (!toUpdate.isEmpty()) {
-                storage.bulkUpdateEntries(toUpdate);
+                if (!strict) storage.bulkUpdateEntries(toUpdate);
+                else if (storage instanceof MySqlStorage sql) sql.bulkUpdateEntries(toUpdate, true);
+                else if (storage instanceof SqliteLeaderboardStorage sqlite) sqlite.bulkUpdateEntries(toUpdate, true);
+                else throw new IllegalStateException("Unsupported leaderboard storage for hot unload");
             }
         });
     }
@@ -273,6 +284,11 @@ public class LeaderboardExpansion implements AuroraExpansion, Listener {
 
     public Set<String> getBoards() {
         return descriptors.keySet();
+    }
+
+    public void detachBoards(ClassLoader owner) {
+        descriptors.entrySet().removeIf(entry -> entry.getValue().valueMapper().getClass().getClassLoader() == owner
+                || entry.getValue().formatMapper().getClass().getClassLoader() == owner);
     }
 
     public String getEmptyPlaceholder() {

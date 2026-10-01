@@ -34,4 +34,33 @@ class LateDataHolderTest {
         CompletableFuture.allOf(CompletableFuture.runAsync(() -> user.initMissingData(Holder.class)), CompletableFuture.runAsync(() -> user.initMissingData(Holder.class))).join();
         assertEquals(1, user.getDataHolders().size());
     }
+
+    @Test void detachedPluginLeavesLatestDataWithoutItsLiveObjects() {
+        var yaml = new YamlConfiguration(); yaml.set("other-plugin.sentinel", "keep");
+        var user = new AuroraUser(UUID.randomUUID(), true); user.initData(yaml, Set.of(Holder.class));
+        ((Holder) user.getDataHolders().iterator().next()).progress = 37;
+        user.detachData(Holder.class.getClassLoader());
+        assertTrue(user.getDataHolders().isEmpty());
+        assertEquals(37, yaml.getInt("aurora/late-test.progress"));
+        assertEquals("keep", yaml.getString("other-plugin.sentinel"));
+        user.initMissingData(Holder.class);
+        assertEquals(37, ((Holder) user.getDataHolders().iterator().next()).progress);
+    }
+
+    @Test void detachedUnloadedPlaceholderNeverWritesDefaultsOverStoredData() {
+        var yaml = new YamlConfiguration(); yaml.set("aurora/late-test.progress", 61);
+        var user = new AuroraUser(UUID.randomUUID(), false); user.initData(yaml, Set.of(Holder.class));
+        user.detachData(Holder.class.getClassLoader());
+        assertTrue(user.getDataHolders().isEmpty());
+        assertEquals(61, yaml.getInt("aurora/late-test.progress"));
+        assertFalse(user.isLoaded());
+    }
+
+    @Test void freshlyCreatedSqlUserCanDetachBeforeItsFirstReloadFromStorage() {
+        var user = new AuroraUser(UUID.randomUUID(), true); user.initData(null, Set.of(Holder.class));
+        ((Holder) user.getDataHolders().iterator().next()).progress = 21;
+        user.detachData(Holder.class.getClassLoader());
+        assertEquals(21, user.getConfiguration().getInt("aurora/late-test.progress"));
+        assertTrue(user.getDataHolders().isEmpty());
+    }
 }
