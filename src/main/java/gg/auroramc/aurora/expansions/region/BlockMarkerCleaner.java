@@ -35,6 +35,7 @@ public final class BlockMarkerCleaner implements Listener {
     private final Map<ChunkId, Job> jobs = new ConcurrentHashMap<>();
     private final Semaphore slots = new Semaphore(MAX_PENDING);
     private final AtomicBoolean wakePending = new AtomicBoolean();
+    private final AtomicBoolean rescanRequested = new AtomicBoolean();
     private final LongAdder chunks = new LongAdder(), legacy = new LongAdder(), clears = new LongAdder();
     private final LongAdder deleted = new LongAdder(), skipped = new LongAdder(), queueSkipped = new LongAdder();
     private final AtomicLong maxBatchNanos = new AtomicLong();
@@ -42,11 +43,13 @@ public final class BlockMarkerCleaner implements Listener {
     private final LongAdder batchCount = new LongAdder(), totalBatchNanos = new LongAdder();
     private volatile boolean enabled, closed, saving;
     private volatile Job active;
+    private volatile LoadedScan scan; // Cursor belongs to the global region; only UUIDs/packed coordinates are retained.
 
     public BlockMarkerCleaner(Aurora plugin) { this.plugin = plugin; }
 
     public boolean isEnabled() { return enabled && !closed; }
     public boolean isSaving() { return saving; }
+    public boolean isScanning() { return isEnabled() && (scan != null || rescanRequested.get()); }
 
     public record Status(boolean enabled, int pendingChunks, long completedChunks, long compactedLegacyKeys,
                          long compactedClearKeys, long deletedKeys, long skippedKeys, long queueSkippedChunks,
@@ -74,24 +77,50 @@ public final class BlockMarkerCleaner implements Listener {
     private void apply(boolean value) {
         enabled = value;
         if (!value) { cancelJobs(); return; }
-        for (var world : Bukkit.getWorlds()) for (var chunk : world.getLoadedChunks()) {
-            enqueue(new ChunkId(world.getUID(), chunk.getX(), chunk.getZ()));
-        }
+        rescanRequested.set(false);
+        scan = new LoadedScan();
+        wake();
     }
 
     /** Call on the owning region; only coordinates leave this callback. */
     public void request(Chunk chunk) {
         if (!isEnabled() || chunk.getPersistentDataContainer().isEmpty()) return;
-        enqueue(new ChunkId(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ()));
+        if (!enqueue(new ChunkId(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ())) && isEnabled()) {
+            queueSkipped.increment();
+            // A load event has no cursor. One further loaded-chunk scan recovers overflow without a second queue.
+            rescanRequested.set(true);
+        }
+        wake();
     }
 
-    private void enqueue(ChunkId id) {
-        if (!isEnabled() || jobs.containsKey(id)) return;
-        if (!slots.tryAcquire()) { queueSkipped.increment(); return; }
+    private boolean enqueue(ChunkId id) {
+        if (!isEnabled()) return false;
+        if (jobs.containsKey(id)) return true;
+        if (!slots.tryAcquire()) return false;
         var job = new Job(id);
-        if (jobs.putIfAbsent(id, job) != null) { slots.release(); return; }
+        if (jobs.putIfAbsent(id, job) != null) { slots.release(); return true; }
         if (!isEnabled()) discard(job);
-        wake();
+        return true;
+    }
+
+    /** Refill on the global region, never retaining Chunk/World objects or advancing past a full queue. */
+    private void fillQueue() {
+        if (slots.availablePermits() == 0) return;
+        if (scan == null && rescanRequested.getAndSet(false)) {
+            scan = new LoadedScan();
+            if (!isEnabled()) { scan = null; return; }
+        }
+        var cursor = scan;
+        if (cursor == null) return;
+        long deadline = System.nanoTime() + 1_000_000;
+        for (int examined = 0; isEnabled() && scan == cursor && slots.availablePermits() > 0
+                && examined < MAX_PENDING; examined++) {
+            var id = cursor.peek();
+            if (id == null) { scan = null; return; }
+            if (!enqueue(id)) return;
+            cursor.advance();
+            if (System.nanoTime() >= deadline) return;
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -120,6 +149,7 @@ public final class BlockMarkerCleaner implements Listener {
         Bukkit.getGlobalRegionScheduler().run(plugin, task -> {
             wakePending.set(false);
             if (!isEnabled()) return;
+            fillQueue();
             if (active != null && current(active)) return;
             active = null;
             for (var job : jobs.values()) {
@@ -128,6 +158,7 @@ public final class BlockMarkerCleaner implements Listener {
                 schedule(job);
                 break;
             }
+            if (active == null && isScanning()) wake();
         });
     }
 
@@ -191,6 +222,8 @@ public final class BlockMarkerCleaner implements Listener {
     }
 
     private void cancelJobs() {
+        scan = null;
+        rescanRequested.set(false);
         for (var job : jobs.values()) discard(job);
         active = null;
     }
@@ -205,7 +238,8 @@ public final class BlockMarkerCleaner implements Listener {
                 reply(sender, "&eCleaner：" + (s.enabled() ? "开启" : "关闭") + "；待处理区块 " + s.pendingChunks()
                         + "；本次运行已处理 " + s.completedChunks() + "，收拢旧键 " + s.compactedLegacyKeys()
                         + "，收拢覆盖键 " + s.compactedClearKeys() + "，删除失效键 " + s.deletedKeys()
-                        + "，保留/跳过 " + s.skippedKeys() + "，队列满跳过区块 " + s.queueSkippedChunks()
+                        + "，保留/跳过 " + s.skippedKeys() + "，队列满延后请求 " + s.queueSkippedChunks()
+                        + "；补扫" + (isScanning() ? "进行中" : "完成")
                         + "；最高批次 " + String.format(Locale.ROOT, "%.2f", s.maxBatchMillis()) + " ms");
                 return;
             }
@@ -251,6 +285,33 @@ public final class BlockMarkerCleaner implements Listener {
     }
 
     private record ChunkId(UUID world, int x, int z) {}
+    private static final class LoadedScan {
+        final Iterator<UUID> worlds = Bukkit.getWorlds().stream().map(org.bukkit.World::getUID).toList().iterator();
+        UUID world;
+        long[] coordinates;
+        int index;
+
+        ChunkId peek() {
+            while (coordinates == null) {
+                if (!worlds.hasNext()) return null;
+                world = worlds.next();
+                var loadedWorld = Bukkit.getWorld(world);
+                if (loadedWorld == null) continue;
+                var loaded = loadedWorld.getLoadedChunks();
+                if (loaded.length == 0) continue;
+                coordinates = new long[loaded.length];
+                for (int i = 0; i < loaded.length; i++)
+                    coordinates[i] = ((long) loaded[i].getX() << 32) | (loaded[i].getZ() & 0xffffffffL);
+                index = 0;
+            }
+            long coordinate = coordinates[index];
+            return new ChunkId(world, (int) (coordinate >> 32), (int) coordinate);
+        }
+
+        void advance() {
+            if (++index == coordinates.length) { coordinates = null; world = null; }
+        }
+    }
     private static final class Job {
         final ChunkId id;
         volatile boolean cancelled;
