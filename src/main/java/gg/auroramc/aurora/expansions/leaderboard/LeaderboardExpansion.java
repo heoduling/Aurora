@@ -213,12 +213,21 @@ public class LeaderboardExpansion implements AuroraExpansion, Listener {
         });
     }
 
-    private void populateBoardValues(AuroraUser user, Player player, HashSet<BoardValue> values, String board) {
+    void populateBoardValues(AuroraUser user, Player player, HashSet<BoardValue> values, String board) {
         if (player != null && player.hasPermission("aurora.leaderboard.prevent." + board)) {
             return;
         }
-        double value = descriptors.get(board).valueMapper.apply(user);
-        if (value >= descriptors.get(board).minValue) {
+        var descriptor = descriptors.get(board);
+        if (descriptor == null) {
+            // The owning plugin can be unloaded while users retain already computed,
+            // unsaved entries. Persist that real value without invoking retired code.
+            var retained = user.getLeaderboardEntries().get(board);
+            if (retained == null) throw new IllegalStateException("Missing leaderboard descriptor and retained value: " + board);
+            values.add(new BoardValue(board, retained.getValue()));
+            return;
+        }
+        double value = descriptor.valueMapper.apply(user);
+        if (value >= descriptor.minValue) {
             values.add(new BoardValue(board, value));
         }
     }
@@ -259,8 +268,10 @@ public class LeaderboardExpansion implements AuroraExpansion, Listener {
             if (player != null && player.hasPermission("aurora.leaderboard.prevent." + board)) {
                 continue;
             }
-            double value = descriptors.get(board).valueMapper.apply(user);
-            if (value >= descriptors.get(board).minValue) {
+            var descriptor = descriptors.get(board);
+            if (descriptor == null) continue; // No recalculation while detached; keep its last computed entry for saving.
+            double value = descriptor.valueMapper.apply(user);
+            if (value >= descriptor.minValue) {
                 var entries = user.getLeaderboardEntries();
                 if (entries.containsKey(board)) {
                     entries.get(board).setValue(value);

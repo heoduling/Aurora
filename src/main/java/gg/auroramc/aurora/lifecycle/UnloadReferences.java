@@ -76,23 +76,35 @@ final class UnloadReferences {
             var factories = (Map<Class<?>, Object>) RuntimeAccess.get(help, "topicFactoryMap");
             factories.entrySet().removeIf(e -> owned(e.getKey().getClassLoader(), owners) || owned(e.getValue().getClass().getClassLoader(), owners));
             var topics = (Map<String, HelpTopic>) RuntimeAccess.get(help, "helpTopics");
+            var roots = new ArrayList<>(topics.values());
+            roots.add((HelpTopic) RuntimeAccess.get(help, "defaultTopic"));
+            var visited = Collections.newSetFromMap(new IdentityHashMap<HelpTopic, Boolean>());
+            for (var topic : roots) clearIndex(topic, owners, visited);
             var removed = Collections.newSetFromMap(new IdentityHashMap<HelpTopic, Boolean>());
-            for (var topic : topics.values()) {
-                if (owned(topic.getClass().getClassLoader(), owners)) removed.add(topic);
-                else if (topic instanceof GenericCommandHelpTopic) {
-                    var command = RuntimeAccess.get(topic, "command");
-                    if (owned(command.getClass().getClassLoader(), owners)
-                            || command instanceof PluginIdentifiableCommand pluginCommand
-                            && owned(pluginCommand.getPlugin().getClass().getClassLoader(), owners)) removed.add(topic);
-                }
-            }
-            var indexes = new ArrayList<>(topics.values());
-            indexes.add((HelpTopic) RuntimeAccess.get(help, "defaultTopic"));
+            for (var topic : topics.values()) if (ownedTopic(topic, owners)) removed.add(topic);
             topics.values().removeIf(removed::contains);
-            for (var topic : indexes) if (topic instanceof IndexHelpTopic) {
-                ((Collection<HelpTopic>) RuntimeAccess.get(topic, "allTopics")).removeIf(removed::contains);
-            }
         }
+    }
+    @SuppressWarnings("unchecked") static void clearIndex(HelpTopic topic, Set<ClassLoader> owners, Set<HelpTopic> visited) throws ReflectiveOperationException {
+        if (topic == null || !visited.add(topic) || !(topic instanceof IndexHelpTopic)) return;
+        var entries = (Collection<HelpTopic>) RuntimeAccess.get(topic, "allTopics");
+        var retained = new ArrayList<HelpTopic>(entries.size());
+        for (var child : entries) {
+            if (!ownedTopic(child, owners)) { clearIndex(child, owners, visited); retained.add(child); }
+        }
+        // Read-only collections can reject removeIf even when no element matches.
+        // Inspect children directly: an earlier interrupted pass may have removed their root entries.
+        if (retained.size() != entries.size()) RuntimeAccess.set(topic, "allTopics", retained);
+    }
+    private static boolean ownedTopic(HelpTopic topic, Set<ClassLoader> owners) throws ReflectiveOperationException {
+        if (owned(topic.getClass().getClassLoader(), owners)) return true;
+        if (topic instanceof GenericCommandHelpTopic) {
+            var command = RuntimeAccess.get(topic, "command");
+            return owned(command.getClass().getClassLoader(), owners)
+                    || command instanceof PluginIdentifiableCommand identified
+                    && owned(identified.getPlugin().getClass().getClassLoader(), owners);
+        }
+        return false;
     }
     private static boolean owned(ClassLoader loader, Set<ClassLoader> owners) { return loader != null && owners.contains(loader); }
     static CompletableFuture<Void> flushBeans(List<Class<?>> beans, Set<ThreadGroup> groups) {

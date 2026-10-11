@@ -1,4 +1,12 @@
-# Block provenance maintenance: 2.6.0-1
+# Current maintenance: 2.6.0-11
+
+Fixes immutable and nested/orphaned help-index cleanup, saves already computed leaderboard entries after a dependent plugin detaches, and adds `/aurora recover` (`aurora.core.admin.recover`, default OP). Recovery retains the update protection until strict saving and the native reload/readiness checks finish. If a replacement Quests JAR is absent, restore its original filename shown in the error before retrying. A disposed main storage cannot be resumed by this command and requires a maintenance restart.
+
+Validated with Java 25, Shiroha 26.2-DEV-a8f1d54, PlugManX 3.1.0-Beta.2, AuroraQuests 2.5.0-5 and private local MySQL. Evidence is kept outside the distributable JAR under `audit/aurora-native-recovery-20261011` in the maintenance workspace. No database schema, quest configuration or cleaner behavior changes. Source builds still require the existing local compile-only API dependencies in `libs`; these third-party binaries are not included in the source-only ZIP.
+
+For the production upgrade from 2.6.0-10, prefer a maintenance shutdown and replacement: unloading the old binary still runs its old faulty code. The regression tests cover the new binary's unload/reload and built-in recovery, not an unconditional live upgrade from every old state.
+
+## Historical block provenance maintenance: 2.6.0-1
 
 Based on upstream `cc683e6d5752f831ba778c8066567b585c04b64c` (2.6.0).
 

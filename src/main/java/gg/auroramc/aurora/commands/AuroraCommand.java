@@ -30,6 +30,12 @@ public class AuroraCommand extends BaseCommand {
         this.plugin = plugin;
     }
 
+    @Subcommand("recover")
+    @CommandPermission("aurora.core.admin.recover")
+    public void onRecover(CommandSender sender) {
+        plugin.getHotReload().recover(sender);
+    }
+
     @Subcommand("cleaner")
     @CommandCompletion("on|off|status")
     @CommandPermission("aurora.core.admin.cleaner")
