@@ -39,7 +39,8 @@ public class MySqlStorage implements UserStorage, LeaderboardStorage {
         config.setPoolName("aurora-pool");
         config.setConnectionTimeout(5000);
         // config.setJdbcUrl("jdbc:mysql://" + credentials.host() + ":" + credentials.port() + "/" + credentials.database() + "?useSSL=" + credentials.ssl() + "&rewriteBatchedStatements=true");
-        config.setJdbcUrl("jdbc:mysql://" + credentials.host() + ":" + credentials.port() + "/" + credentials.database() + "?useSSL=" + credentials.ssl());
+        config.setJdbcUrl("jdbc:mysql://" + credentials.host() + ":" + credentials.port() + "/" + credentials.database() + "?useSSL=" + credentials.ssl()
+                + "&connectTimeout=5000&socketTimeout=15000");
         config.setUsername(credentials.username());
         config.setPassword(credentials.password());
         config.setMaximumPoolSize(poolSize);

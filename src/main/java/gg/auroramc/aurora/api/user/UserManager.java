@@ -227,7 +227,15 @@ public class UserManager implements Listener {
         if (count != users.size()) throw new IllegalStateException("Player storage saved " + count + "/" + users.size() + " records");
         var dirty = new HashMap<UUID, Collection<String>>();
         for (var user : users) dirty.put(user.getUniqueId(), new ArrayList<>(user.getDirtyLeaderboards().keySet()));
-        Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class).saveForHotUnload(dirty).join();
+        // Track a timed-out write until it really finishes: a retry must not race it.
+        var saved = track(Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class).saveForHotUnload(dirty));
+        try { saved.get(30, java.util.concurrent.TimeUnit.SECONDS); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while saving hot-unload leaderboards", interrupted);
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException failure) {
+            throw new IllegalStateException("Hot-unload leaderboard save did not complete", failure);
+        }
         Aurora.getInstance().getLogger().info("Saved loaded player data before hot unload: " + count);
     }
 

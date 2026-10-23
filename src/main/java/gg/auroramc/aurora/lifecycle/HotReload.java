@@ -192,7 +192,6 @@ public final class HotReload implements Listener {
             var plugman = Bukkit.getPluginManager().getPlugin("PlugManX");
             try {
                 if (plugman == null || !plugman.isEnabled()) throw new IllegalStateException("PlugManX is unavailable");
-                if ((boolean) RuntimeAccess.get(plugin, "hotUnloadSaved")) throw new IllegalStateException("Aurora storage was already closed; maintenance restart is required");
                 var targetName = interruptedTarget;
                 stage = "恢复前等待数据操作结束";
                 await(() -> Aurora.getUserManager().getActiveLoads() == 0 && Aurora.getUserManager().getActiveOperations() == 0
@@ -222,13 +221,14 @@ public final class HotReload implements Listener {
 
     private void reportFailure(Throwable failure) {
         plugin.getLogger().log(Level.SEVERE, "AURORA_UPDATE_FAILED stage=" + stage + "; protection=" + paused
-                + ". 保留数据，未强行解除保护。修复原因后在控制台执行 aurora recover；阶段若显示存储已关闭则需维护重启。", failure);
+                + ". 任务数据保留，玩家仍可进服。修复原因后在控制台执行 aurora recover。", failure);
     }
 
     private void perform(Plugin plugman, Plugin target, String operation, ScheduledTask coordinator) throws Exception {
-        if (Runtime.version().feature() != 25 || !Set.of("26.2-DEV-9daa83b (MC: 26.2)", "26.2-DEV-a8f1d54 (MC: 26.2)").contains(Bukkit.getVersion())) throw new IllegalStateException("Unverified server version: " + Bukkit.getVersion());
+        if (Runtime.version().feature() != 25 || !Set.of("26.2-DEV-9daa83b (MC: 26.2)", "26.2-DEV-a8f1d54 (MC: 26.2)", "26.2-DEV-28fe077 (MC: 26.2)").contains(Bukkit.getVersion())) throw new IllegalStateException("Unverified server version: " + Bukkit.getVersion());
         if (!plugman.getDescription().getVersion().equals("3.1.0-Beta.2")) throw new IllegalStateException("Unverified PlugManX version");
         CommandTreeGate.pool();
+        UnloadReferences.threads(); // Validate the core layout before pausing any plugin work.
         var managerType = Class.forName("core.com.rylinaux.plugman.plugins.PluginManager", true, plugman.getClass().getClassLoader());
         var manager = RuntimeAccess.call(RuntimeAccess.call(plugman, "getServiceRegistry"), "get", managerType);
         var main = target == plugin;
@@ -247,7 +247,7 @@ public final class HotReload implements Listener {
             }
         }
         await(() -> commandChanges.isEmpty() && Aurora.getUserManager().getActiveLoads() == 0
-                && Aurora.getUserManager().getActiveOperations() == 0 && !Aurora.getUserManager().hasUnreadyOnlineUsers(), "Player data is still loading");
+                && Aurora.getUserManager().getActiveOperations() == 0 && (paused || !Aurora.getUserManager().hasUnreadyOnlineUsers()), "Player data is still loading");
         checkCommandFailures();
         var files = new HashMap<String, String>();
         for (var old : pair) files.put(old.getName(), ((File) RuntimeAccess.get(old, "file")).getName().replaceFirst("\\.jar$", ""));
@@ -319,14 +319,14 @@ public final class HotReload implements Listener {
         UnloadReferences.clearContexts(pair, threads);
         stage = "保存玩家数据及排行榜";
         Aurora.getUserManager().saveForHotUnload();
-        if (main) {
-            Aurora.getUserManager().getStorage().dispose();
-            var boards = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
-            if (!Aurora.getLibConfig().getStorageType().equals("mysql")) boards.dispose();
-            plugin.markHotUnloadSaved();
-        }
-        stage = main ? "存储已关闭，卸载及清理插件引用" : "卸载及清理插件引用";
-        CommandTreeGate.run(plugman, () -> {
+        if (main) plugin.markHotUnloadSaved();
+        // Retain usable storage if PlugMan refuses to disable the main plugin. Close only
+        // after actual disable, on this async coordinator, including partial unload failure.
+        var oldStorage = Aurora.getUserManager().getStorage();
+        var oldBoards = Aurora.getExpansionManager().getExpansion(LeaderboardExpansion.class);
+        boolean separateBoards = !Aurora.getLibConfig().getStorageType().equals("mysql");
+        stage = "卸载及清理插件引用";
+        try { CommandTreeGate.run(plugman, () -> {
             for (var old : pair) {
                 if (old != plugin && !operation.equals("disable")) detach(old);
                 allowedUnload = old;
@@ -348,7 +348,15 @@ public final class HotReload implements Listener {
                     if (!(boolean) RuntimeAccess.call(result, "success")) throw new IllegalStateException("Failed to load " + old.getName());
                 });
             }
-        });
+        }); } finally {
+            if (main && !plugin.isEnabled()) {
+                oldStorage.dispose();
+                if (separateBoards) oldBoards.dispose();
+            }
+        }
+        // Players may join while tasks are paused. Restore their Aurora data before
+        // waiting for the replacement Quests profiles; loading Aurora alone never loads Quests.
+        if (!main) waitFor(global(plugman, () -> Aurora.getUserManager().resumeAfterHotUnload()));
         stage = "检查玩家资料和指令";
         if (Set.of("reload", "restart", "enable").contains(operation)) await(() -> {
             for (var old : pair) {
@@ -364,7 +372,6 @@ public final class HotReload implements Listener {
         if (!main) {
             waitFor(global(plugman, () -> {
                 Aurora.setDisabling(false);
-                Aurora.getUserManager().resumeAfterHotUnload();
                 paused = false;
             }));
         }
@@ -380,11 +387,6 @@ public final class HotReload implements Listener {
             return current != null && current.isEnabled()
                     && (boolean) RuntimeAccess.call(RuntimeAccess.call(current, "getHotReload"), "isReady");
         } catch (ReflectiveOperationException failure) { throw new IllegalStateException("Could not verify restored Aurora", failure); }
-    }
-
-    @EventHandler(priority = EventPriority.HIGHEST)
-    public void login(AsyncPlayerPreLoginEvent event) {
-        if (paused && !bridgeActive()) event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER, "Aurora 更新处理中，请稍后再试。");
     }
 
     @EventHandler(priority = EventPriority.HIGHEST) public void click(InventoryClickEvent event) {
@@ -458,20 +460,25 @@ public final class HotReload implements Listener {
         if (player == null) { done.complete(null); return done; }
         try {
             var task = player.getScheduler().runDelayed(owner, ignored -> {
+                if (done.isDone()) return;
                 try { if (player.isOnline()) action.accept(player); done.complete(null); }
                 catch (Throwable failure) { done.completeExceptionally(failure); }
             }, () -> done.complete(null), delay);
             if (task == null) done.complete(null);
+            else done.orTimeout(30, TimeUnit.SECONDS).whenComplete((value, failure) -> { if (failure != null) task.cancel(); });
         } catch (Throwable failure) { done.completeExceptionally(failure); }
         return done;
     }
 
     private CompletableFuture<Void> global(Plugin owner, Runnable action) {
         var done = new CompletableFuture<Void>();
-        try { Bukkit.getGlobalRegionScheduler().run(owner, task -> {
+        try { var scheduled = Bukkit.getGlobalRegionScheduler().run(owner, task -> {
+            if (done.isDone()) return;
             try { action.run(); done.complete(null); }
             catch (Throwable failure) { done.completeExceptionally(failure); }
-        }); } catch (Throwable failure) { done.completeExceptionally(failure); }
+        });
+            done.orTimeout(30, TimeUnit.SECONDS).whenComplete((value, failure) -> { if (failure != null) scheduled.cancel(); });
+        } catch (Throwable failure) { done.completeExceptionally(failure); }
         return done;
     }
 

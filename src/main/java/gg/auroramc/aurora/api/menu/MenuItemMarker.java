@@ -38,10 +38,7 @@ public class MenuItemMarker {
     }
 
     public boolean isMarked(@NotNull ItemStack itemStack) {
-        ItemMeta itemMeta = itemStack.getItemMeta();
-        if (itemMeta == null)
-            return false;
-        PersistentDataContainer container = itemMeta.getPersistentDataContainer();
-        return container.has(this.mark, PersistentDataType.BYTE);
+        return !itemStack.isEmpty()
+                && itemStack.getPersistentDataContainer().has(this.mark, PersistentDataType.BYTE);
     }
 }
